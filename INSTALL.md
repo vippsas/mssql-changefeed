@@ -7,8 +7,15 @@ after the number of migrations; not after implied stability, backwards
 compatability etc.
 
 ## Installation instructions
-Deploy the SQL migration in `migrations/from0001/0001.changefeed.sql` using your
-SQL migration pipeline. It assumes that `go` is available to denote
+Deploy the following SQL migrations in your
+SQL migration pipeline:
+
+```
+migrations/from0001/0001.changefeed.sql
+migrations/from0001/0002.changefeed.sql
+```
+
+It assumes that `go` is available to denote
 batch split; adjust if needed. The migration will create and populate the `changefeed` schema.
 
 The main implementation is in SQL and using Go is **NOT** needed for using this

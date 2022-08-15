@@ -42,16 +42,21 @@ type Fixture struct {
 var fixture = Fixture{}
 
 func (f *Fixture) RunMigrations() {
-	migrationSql, err := ioutil.ReadFile("migrations/from0001/0001.changefeed.sql")
-	if err != nil {
-		panic(err)
-	}
-	parts := strings.Split(string(migrationSql), "\ngo\n")
-	for _, p := range parts {
-		_, err = f.DB.Exec(p)
+	for _, filename := range []string{
+		"migrations/from0001/0001.changefeed.sql",
+		"migrations/from0001/0002.changefeed.sql",
+	} {
+		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
-			fmt.Println(p)
 			panic(err)
+		}
+		parts := strings.Split(string(migrationSql), "\ngo\n")
+		for _, p := range parts {
+			_, err = f.DB.Exec(p)
+			if err != nil {
+				fmt.Println(p)
+				panic(err)
+			}
 		}
 	}
 }
@@ -216,6 +221,54 @@ insert into changefeed.change(feed_id, shard, change_id) values
 		{1000000000000009, 2000000000000006},
 	}, sqltest.Query(fixture.DB, `select change_id, change_sequence_number from changefeed.change where feed_id = 1 and shard = 0 and change_id > 1000000000000003 order by change_id`))
 
+}
+
+func TestSweepMultiFeed(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	fixture.Reset(t)
+
+	require.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `
+insert into changefeed.feed(feed_id, name) values
+  (1, 'feed_1'),
+  (2, 'feed_2'),
+  (3, 'feed_3');
+
+insert into changefeed.shard(feed_id, shard, sweep_group) values
+  (1, 0, 100),
+  (2, 0, 100),
+  (3, 0, 101);
+
+insert into changefeed.change(feed_id, shard, change_id) values
+  (2, 0, next value for changefeed.change_id);
+
+declare @cid bigint = next value for changefeed.change_id;  
+insert into changefeed.change(feed_id, shard, change_id) values
+  (1, 0, @cid),
+  (2, 0, @cid),
+  (3, 0, @cid), -- not swept
+  (1, 0, next value for changefeed.change_id),
+  (2, 0, next value for changefeed.change_id),
+  (3, 1, next value for changefeed.change_id);  -- not swept
+`)))
+
+	rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", 100))
+	// check and patch latency ms as this is unpredicatble
+	assert.True(t, rows[0][3].(int) > 0 && rows[0][3].(int) < 1000)
+	rows[0][3] = nil
+	assert.True(t, rows[1][3].(int) > 0 && rows[1][3].(int) < 1000)
+	rows[1][3] = nil
+
+	assert.Equal(t, sqltest.Rows{
+		{1, 1000000000000001, 2000000000000001},
+		{1, 1000000000000002, 2000000000000002},
+		{2, 1000000000000000, 2000000000000001},
+		{2, 1000000000000001, 2000000000000002},
+		{2, 1000000000000003, 2000000000000003},
+		{3, 1000000000000001, nil},
+		{3, 1000000000000004, nil},
+	}, sqltest.Query(fixture.DB, `select feed_id, change_id, change_sequence_number from changefeed.change order by feed_id, change_id`))
 }
 
 func TestSweepRaceProtection(t *testing.T) {

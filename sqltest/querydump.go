@@ -74,6 +74,9 @@ func RowIteratorToSlice(rows *sql.Rows) (columns []string, result Rows) {
 		}
 		result = append(result, row)
 	}
+	if err := rows.Err(); err != nil {
+		panic(err)
+	}
 	return
 }
 
