@@ -1,12 +1,14 @@
--- mssql-changefeed VERSION 1
+-- mssql-changefeed migration 0001
 --
--- NOTE: Removed buggy changefeed.sweep procedure; bugfixed version is in 0002.changefeed.sql.
+-- THE ORIGINAL VERSION OF THIS FILE LIVES IN github.com/vippsas/mssql-changefeed.
 --
--- github.com/vippsas/mssql-changefeed
---
--- IF YOU EDIT THIS FILE FROM UPSTREAM, PLEASE RECORD THE CHANGES HERE TO HELP FUTURE UPGRADES:
+-- IF YOU EDIT THIS COPY IN YOUR LOCAL REPOSITORY, PLEASE RECORD THE CHANGES HERE, TO HELP
+-- YOURSELF WITH FUTURE UPGRADES:
 --
 -- END CHANGES
+--
+-- Upstream changelog:
+--    v2: Removed changefeed.sweep from this file, it is introduced in 0002.changefeed.sql
 --
 create schema changefeed;
 
