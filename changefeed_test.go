@@ -45,6 +45,8 @@ func (f *Fixture) RunMigrations() {
 	for _, filename := range []string{
 		"migrations/from0001/0001.changefeed.sql",
 		"migrations/from0001/0002.changefeed.sql",
+		"migrations/from0001/0003.changefeed.sql",
+		"migrations/from0001/0004.changefeed.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
@@ -150,6 +152,14 @@ func TestDatabaseSetup(t *testing.T) {
 }
 
 func TestSweepHappyDay(t *testing.T) {
+	testSweepHappyDay(t, false)
+}
+
+func TestSweepHappyDay_Loop(t *testing.T) {
+	testSweepHappyDay(t, true)
+}
+
+func testSweepHappyDay(t *testing.T, useloop bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -179,17 +189,35 @@ insert into changefeed.change(feed_id, shard, change_id) values
   (2, 0, next value for changefeed.change_id);
 `)))
 
-	rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", 100))
-	// check and patch latency ms as this is unpredicatble
-	assert.True(t, rows[0][3].(int) > 0 && rows[0][3].(int) < 1000)
-	rows[0][3] = nil
-	assert.True(t, rows[1][3].(int) > 0 && rows[1][3].(int) < 1000)
-	rows[1][3] = nil
+	const sweepGroup = 100
 
-	assert.Equal(t, sqltest.Rows{
-		{1, 0, 4, nil},
-		{2, 0, 2, nil},
-	}, rows)
+	// Perhaps in the future we just remove changefeed.sweep() and demand that
+	// you call sweep_loop with all-0 parameters, but keeping tests for both
+	// in place for now.
+	if useloop {
+		var changeCount, lagMs, iterations int
+		assert.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `changefeed.sweep_loop`,
+			sql.Named("sweep_group", sweepGroup),
+			sql.Named("wait_milliseconds", 0),
+			sql.Named("duration_milliseconds", 0),
+			sql.Named("sleep_milliseconds", 0),
+			sql.Named("change_count", sql.Out{Dest: &changeCount}),
+			sql.Named("max_lag_milliseconds", sql.Out{Dest: &lagMs}),
+			sql.Named("iterations", sql.Out{Dest: &iterations}),
+		)))
+	} else {
+		rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", sweepGroup))
+		// check and patch latency ms as this is unpredicatble
+		assert.True(t, rows[0][3].(int) > 0 && rows[0][3].(int) < 1000)
+		rows[0][3] = nil
+		assert.True(t, rows[1][3].(int) > 0 && rows[1][3].(int) < 1000)
+		rows[1][3] = nil
+
+		assert.Equal(t, sqltest.Rows{
+			{1, 0, 4, nil},
+			{2, 0, 2, nil},
+		}, rows)
+	}
 
 	// sweep_group=100 assigns to (1,0) and (2,0), but leaves (1,1) alone
 	assert.Equal(t, sqltest.Rows{
@@ -210,11 +238,24 @@ insert into changefeed.change(feed_id, shard, change_id) values
   (1, 0, next value for changefeed.change_id)
 `)))
 
-	rows = sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", 100))
-	rows[0][3] = nil
-	assert.Equal(t, sqltest.Rows{
-		{1, 0, 2, nil},
-	}, rows)
+	if useloop {
+		var changeCount, lagMs, iterations int
+		assert.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `changefeed.sweep_loop`,
+			sql.Named("sweep_group", sweepGroup),
+			sql.Named("wait_milliseconds", 0),
+			sql.Named("duration_milliseconds", 0),
+			sql.Named("sleep_milliseconds", 0),
+			sql.Named("change_count", sql.Out{Dest: &changeCount}),
+			sql.Named("max_lag_milliseconds", sql.Out{Dest: &lagMs}),
+			sql.Named("iterations", sql.Out{Dest: &iterations}),
+		)))
+	} else {
+		rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", 100))
+		rows[0][3] = nil
+		assert.Equal(t, sqltest.Rows{
+			{1, 0, 2, nil},
+		}, rows)
+	}
 
 	assert.Equal(t, sqltest.Rows{
 		{1000000000000008, 2000000000000005},
@@ -224,6 +265,14 @@ insert into changefeed.change(feed_id, shard, change_id) values
 }
 
 func TestSweepMultiFeed(t *testing.T) {
+	testSweepMultiFeed(t, false)
+}
+
+func TestSweepMultiFeed_Loop(t *testing.T) {
+	testSweepMultiFeed(t, true)
+}
+
+func testSweepMultiFeed(t *testing.T, useloop bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -253,12 +302,26 @@ insert into changefeed.change(feed_id, shard, change_id) values
   (3, 1, next value for changefeed.change_id);  -- not swept
 `)))
 
-	rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", 100))
-	// check and patch latency ms as this is unpredicatble
-	assert.True(t, rows[0][3].(int) > 0 && rows[0][3].(int) < 1000)
-	rows[0][3] = nil
-	assert.True(t, rows[1][3].(int) > 0 && rows[1][3].(int) < 1000)
-	rows[1][3] = nil
+	const sweepGroup = 100
+	if useloop {
+		var changeCount, lagMs, iterations int
+		assert.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `changefeed.sweep_loop`,
+			sql.Named("sweep_group", sweepGroup),
+			sql.Named("wait_milliseconds", 0),
+			sql.Named("duration_milliseconds", 0),
+			sql.Named("sleep_milliseconds", 0),
+			sql.Named("change_count", sql.Out{Dest: &changeCount}),
+			sql.Named("max_lag_milliseconds", sql.Out{Dest: &lagMs}),
+			sql.Named("iterations", sql.Out{Dest: &iterations}),
+		)))
+	} else {
+		rows := sqltest.Query(fixture.DB, `changefeed.sweep`, sql.Named("sweep_group", sweepGroup))
+		// check and patch latency ms as this is unpredicatble
+		assert.True(t, rows[0][3].(int) > 0 && rows[0][3].(int) < 1000)
+		rows[0][3] = nil
+		assert.True(t, rows[1][3].(int) > 0 && rows[1][3].(int) < 1000)
+		rows[1][3] = nil
+	}
 
 	assert.Equal(t, sqltest.Rows{
 		{1, 1000000000000001, 2000000000000001},
