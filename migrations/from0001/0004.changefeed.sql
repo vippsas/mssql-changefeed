@@ -10,21 +10,22 @@
 -- even if it could technically be said to be NULL..
 --
 -- See example usage in README.md
-create procedure changefeed.sweep_loop(
+create or alter procedure changefeed.sweep_loop(
     @sweep_group smallint,
     @wait_milliseconds int,
     @duration_milliseconds int,
     @sleep_milliseconds int,
     @change_count int output,
-    @max_lag_milliseconds int output,
+    @max_lag_milliseconds bigint output,
     @iterations int output
-)
+    )
 as begin
     set nocount, xact_abort on
     declare @sweep_lock nvarchar(255) = changefeed.sweep_lock_name(@sweep_group);
     declare @longpoll_lock nvarchar(255) = concat('changefeed.longpoll/', @sweep_group);
 
     begin try
+        set transaction isolation level read committed;
         declare @endtime datetime2(3) = dateadd(millisecond, @duration_milliseconds, sysutcdatetime());
 
         -- `waitfor delay` is weird, it takes exactly type `datetime` but ignores the date and uses only the time component
@@ -36,18 +37,33 @@ as begin
         declare @longpoll_lock_count int
 
         declare @sweepresult table (
-                                       feed_id smallint not null,
-                                       shard smallint not null,
-                                       change_count int not null,
-                                       lag_milliseconds int not null
-                                   );
+            feed_id smallint not null,
+            shard smallint not null,
+            change_count int not null,
+            last_change_sequence_number bigint not null,
+            lag_milliseconds bigint not null
+        );
 
         declare @longpoll_locks table (
-                                          i int primary key,
-                                          feed_id int,
-                                          shard int,
-                                          lock nvarchar(255)
-                                      );
+            i int primary key,
+            feed_id int,
+            shard int,
+            lock nvarchar(255)
+        );
+
+        declare @toassign table (
+              feed_id smallint not null
+            , shard smallint not null
+            , change_id bigint not null
+            , row_number bigint not null
+        );
+
+        declare @counts table(
+            feed_id smallint not null
+            , shard smallint not null
+            , change_count int not null
+            , primary key (feed_id, shard)
+        );
 
         select @change_count = 0, @iterations = 0, @max_lag_milliseconds = 0;
 
@@ -75,17 +91,17 @@ as begin
 
         select @i = 1;
         while @i <= @longpoll_lock_count
+        begin
+            select @longpoll_lock = lock from @longpoll_locks where i = @i;
+
+            exec @lockresult = sp_getapplock @Resource = @longpoll_lock, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 1000
+            if @lockresult < 0
             begin
-                select @longpoll_lock = lock from @longpoll_locks where i = @i;
-
-                exec @lockresult = sp_getapplock @Resource = @longpoll_lock, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 1000
-                if @lockresult < 0
-                    begin
-                        throw 55001, 'changefeed.sweep_lock assertion failed: Not able to get initial @longpoll_lock', 1;
-                    end
-
-                select @i = @i + 1
+                throw 55001, 'changefeed.sweep_lock assertion failed: Not able to get initial @longpoll_lock', 1;
             end
+
+            select @i = @i + 1
+        end
 
         -- We do a locking dance to support long-polling. Fundamental behavour of Exclusive vs Shared
         -- locks (see demo_longpoll_test.go for tests of how these mechanism works, confirmed
@@ -99,213 +115,150 @@ as begin
         --
 
         while sysutcdatetime() < @endtime
-            begin
-                delete from @sweepresult;
+        begin
+            delete from @sweepresult;
+            delete from @toassign;
+            delete from @counts;
 
-                insert into @sweepresult
-                    exec changefeed.sweep @sweep_group = @sweep_group;
+            -- BEGIN INLINE changefeed.sweep()
+            -- To avoid using #temp tables for communication or insert-exec,
+            -- which has some issues with propagating errors, we inline changefeed.sweep()
+            -- here. The changes in the inlined version is:
+            --
+            --    * setting transaction isolation level has been moved up to
+            --    * no try/catch; instead added "if @@trancount > 0 rollback;" to this proc
+            --    * @toassign/@counts/@sweepresult declarations moved up top, and instead deleting contents here
+            --    * @sweepresult "escapes" from the procedure and is used afterwards
+
+
+            begin transaction;
+
+            insert into @toassign
+            select top(1000)
+                s.feed_id,
+                s.shard,
+                x.change_id,
+                x.row_number
+            from changefeed.shard as s
+            cross apply (
+                select top(1000)
+                    c.change_id,
+                    row_number = row_number() over (partition by c.feed_id, c.shard order by c.change_id)
+                from changefeed.change as c with (index=ix_needs_seqnum)
+                where c.feed_id = s.feed_id and c.shard = s.shard
+                  and c.change_sequence_number is null
+                order by c.change_id  -- important!, see "Consideration to partitioning and event ordering"
+            ) x
+            where s.sweep_group = @sweep_group
+            option (maxdop 1);
+
+            declare @t0 datetime2 = sysutcdatetime();
+
+
+            insert into @counts
+            select feed_id, shard, count(*) as change_count
+            from @toassign
+            group by feed_id, shard;
+
+            update s
+            set
+                s.last_change_sequence_number = s.last_change_sequence_number + co.change_count,
+                last_sweep_time = @t0
+            output
+                inserted.feed_id,
+                inserted.shard,
+                co.change_count,
+                deleted.last_change_sequence_number,
+                datediff_big(millisecond, deleted.last_sweep_time, @t0)
+                into @sweepresult
+            from changefeed.shard as s
+            join @counts as co on co.shard = s.shard and co.feed_id = s.feed_id
+            option (maxdop 1);
+
+            if @@rowcount <> (select count(*) from @counts)
+                begin
+                    throw 55201, 'unexpected update count in changefeed.shard', 1;
+                end;
+
+            update c
+            set
+                change_sequence_number = r.last_change_sequence_number + x.row_number
+            from @toassign as x
+            join changefeed.change c on c.change_id = x.change_id and c.feed_id = x.feed_id and c.shard = x.shard
+            join @sweepresult as r on r.feed_id = c.feed_id and r.shard = c.shard
+            where
+                change_sequence_number is null; -- protect against racing processes!
+
+            if @@rowcount <> (select sum(change_count) from @sweepresult)
+            begin
+                throw 55202, 'race, changefeed.sweep called at the same time for same feed_id, shard_id', 1;
+            end
+
+            commit transaction
+
+            -- END INLINE
+
+            select
+                @change_count = @change_count + (select isnull(sum(change_count), 0) from @sweepresult),
+                @max_lag_milliseconds = (select max(lag_milliseconds) from (
+                  select lag_milliseconds from @sweepresult where change_count > 0
+                  union all select @max_lag_milliseconds as lag_milliseconds where @max_lag_milliseconds is not null
+                ) t),
+                @iterations = @iterations + 1;
+
+            select @i = 1
+            while @i < @longpoll_lock_count
+            begin
+                select @longpoll_lock = null;
+                -- See comments in changefeed.longpoll for how this works:
                 select
-                        @change_count = @change_count + (select isnull(sum(change_count), 0) from @sweepresult),
-                        @max_lag_milliseconds = (select max(lag_milliseconds) from (
-                                                                                       select lag_milliseconds from @sweepresult
-                                                                                       union all select @max_lag_milliseconds as lag_milliseconds where @max_lag_milliseconds is not null
-                                                                                   ) t),
-                        @iterations = @iterations + 1;
+                    @longpoll_lock = lock
+                from @longpoll_locks locks
+                join @sweepresult result on result.feed_id = locks.feed_id and result.shard = locks.shard
+                where result.change_count > 0 and locks.i = @i;
 
-                select @i = 1
-                while @i < @longpoll_lock_count
+                if @longpoll_lock is not null
+                begin
+
+                    exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
+                    exec @lockresult = sp_getapplock @Resource = @longpoll_lock, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 1000
+                    if @lockresult < 0
                     begin
-                        select @longpoll_lock = null;
-                        -- See comments in changefeed.longpoll for how this works:
-                        select
-                                @longpoll_lock = lock
-                        from @longpoll_locks locks
-                                 join @sweepresult result on result.feed_id = locks.feed_id and result.shard = locks.shard
-                        where result.change_count > 0 and locks.i = @i;
-
-                        if @longpoll_lock is not null
-                            begin
-
-                                exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
-                                exec @lockresult = sp_getapplock @Resource = @longpoll_lock, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 1000
-                                if @lockresult < 0
-                                    begin
-                                        throw 55004, 'changefeed.sweep_lock assertion failed: Not able to re-acquire @longpoll_lock', 1;
-                                    end
-                            end
-
-                        select @i = @i + 1
+                        throw 55004, 'changefeed.sweep_lock assertion failed: Not able to re-acquire @longpoll_lock', 1;
                     end
+                end
 
-                waitfor delay @waitfor_arg;
+                select @i = @i + 1
             end
+
+            waitfor delay @waitfor_arg;
+        end
 
         select @i = @longpoll_lock_count;
         while @i >= 1
-            begin
-                select @longpoll_lock = lock from @longpoll_locks where i = @i;
-                exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
+        begin
+            select @longpoll_lock = lock from @longpoll_locks where i = @i;
+            exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
 
-                select @i = @i - 1
-            end
+            select @i = @i - 1
+        end
 
         exec sp_releaseapplock @Resource = @sweep_lock, @LockOwner = 'Session';
     end try
     begin catch
+        if @@trancount > 0 rollback;  -- due to inlined changefeed.sweep
 
         select @i = @longpoll_lock_count;
         while @i >= 1
-            begin
-                select @longpoll_lock = lock from @longpoll_locks where i = @i;
-                exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
+        begin
+             select @longpoll_lock = lock from @longpoll_locks where i = @i;
+             exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Session';
 
-                select @i = @i - 1
-            end
+             select @i = @i - 1
+        end
 
         exec sp_releaseapplock @Resource = @sweep_lock, @LockOwner = 'Session';
 
-        ;throw
-    end catch
-end
-
-go
-
--- Block until the next change by the sweeper.
--- Note: THIS MUST BE USED WITH SOME CARE; there is a race between the time one blocks and when the sweeper
--- writes a change, and this race should be compensated with a call to changefeed.longpoll_guard in another
--- thread. See reference implementation in longpoll.go
-create procedure changefeed.longpoll(
-    @feed_id bigint,
-    @shard smallint,
-    @change_sequence_number bigint, -- only input..
-    @timeout_milliseconds int
-)
-as begin
-    set nocount, xact_abort on
-
-    declare @endtime datetime2 = dateadd(millisecond, @timeout_milliseconds, sysutcdatetime())
-    declare @longpoll_lock nvarchar(255) = concat('changefeed.longpoll/', @feed_id, '/', @shard);
-    declare @t datetime2
-    declare @dt int
-    declare @retval int
-    declare @msg varchar(max)
-    declare @new_sequence_number bigint
-
-    declare @t0 datetime2 = sysutcdatetime()
-
-    begin try
-        while 1 = 1
-            begin
-                select @t = sysutcdatetime()
-                select @dt = datediff(millisecond, @t, @endtime)
-
-                if @dt < 0 break;
-
-                -- Get, and immediately release, the lock. We assume the caller put us in a transaction...
-
-                exec @retval = sp_getapplock @Resource = @longpoll_lock, @LockMode = 'Shared', @LockOwner = 'Transaction', @LockTimeout = @dt;
-
-                if @retval = 1
-                    begin
-                        -- Happy day case, we got lock after a wait. Returning without checking updated sequence
-                        -- number (client could easily read to an even newer number by the time it reads data..)
-                        exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Transaction';
-
-                        return
-                    end
-                else if @retval = 0
-                    begin
-                        -- Immediately got the lock. Something is probably fishy. If the sequence  Start to poll the
-                        -- sequence number and see if it changes, if we so we just got the lock at a *really* lucky
-                        -- moment in time. If it never changes, the sweep_loop is not running.
-                        exec sp_releaseapplock @Resource = @longpoll_lock, @LockOwner = 'Transaction';
-
-                        -- We want to always not read snapshot data, but latest committed state, hence the hint below.
-                        -- The reason we are in a transaction is really just to have the lock request have an easily
-                        -- identifiable owner for longpoll_guard.
-                        select
-                                @new_sequence_number = last_change_sequence_number
-                        from changefeed.shard with (readcommittedlock)
-                        where feed_id = @feed_id and shard = @shard;
-
-                        if @change_sequence_number <> @new_sequence_number return;
-
-                        -- We'll try again after a wait of 100ms; but if this persists for a full second
-                        -- then the sweep_loop is not running and we throw an error.
-                        if datediff(millisecond, @t0, @t) > 1000
-                            begin
-                                throw 55011, 'changefeed.longpoll assertion failed; perhaps changefeed.sweep_loop is not running?', 1;
-                            end
-                        waitfor delay '00:00:00.100'
-                    end
-                else if @retval = -1
-                    begin
-                        -- Timeout
-                        return
-                    end
-                else if @retval < 0
-                    begin
-                        -- Other error condition getting lock; throw error
-                        select @msg = concat('changefeed.longpoll: error while acquiring @longpoll_lock: ', @retval);
-                        throw 55010, @msg, 1;
-                    end
-
-                -- As we loop around here we're in the same kind of race as before entering, which should
-                -- be compensated for by using longpoll_guard.
-            end
-    end try
-    begin catch
-        -- Not releasing lock here; there really should never be a case where the lock is held on exit
-        -- through an error, and anyway it is owned by the transaction.
-        -- Also, since the caller did `begin transaction` we will let the caller roll it back too;
-        ;throw
-    end catch
-end
-
-go
-
--- Block until a given transaction_id has started on the longpolling block...
--- I.e., this will loop and poll for a *short* time (probably just one poll) so that we can confirm
--- that the call to longpoll did not race. Then the longpoll can block for a *long* time.
-create procedure changefeed.longpoll_guard(@transaction_id bigint, @blocked bit output)
-as begin
-    set nocount, xact_abort on
-
-    begin try
-        declare @waitcase int = 1
-        while 1 = 1
-            begin
-                -- Is the longpoll() call blocked yet?
-                if exists(
-                        select 1 from sys.dm_tran_locks as lck
-                        where lck.resource_type = 'APPLICATION'
-                          and lck.request_status = 'WAIT'
-                          and lck.request_owner_type = 'TRANSACTION'
-                          and lck.request_owner_id = @transaction_id
-                    )
-                    begin
-                        -- Success!
-                        select @blocked = 1
-                        return
-                    end
-                -- No... does transaction still live?
-                if not exists (select 1 from sys.dm_tran_active_transactions where transaction_id = @transaction_id)
-                    begin
-                        -- Non-success...
-                        select @blocked = 0
-                        return
-                    end
-                -- Otherwise transaction is active but not yet blocked; wait and see.
-                if @waitcase = 1 waitfor delay '00:00:00.05';
-                else if @waitcase = 2 waitfor delay '00:00:00.010';
-                else if @waitcase = 3 waitfor delay '00:00:00.020';
-                else if @waitcase = 4 waitfor delay '00:00:00.050';
-                else waitfor delay '00:00:00.100';
-
-                select @waitcase = @waitcase + 1
-            end
-    end try
-    begin catch
         ;throw
     end catch
 end

@@ -45,6 +45,8 @@ func (f *Fixture) RunMigrations() {
 	for _, filename := range []string{
 		"migrations/from0001/0001.changefeed.sql",
 		"migrations/from0001/0002.changefeed.sql",
+		"migrations/from0001/0003.changefeed.sql",
+		"migrations/from0001/0004.changefeed.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
