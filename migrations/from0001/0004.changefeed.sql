@@ -114,7 +114,9 @@ as begin
         --    requests coming in, so NEW calls to changefeed.longpoll will not stop us from getting the lock back.
         --
 
-        while sysutcdatetime() < @endtime
+        -- If you pass duration=0, we want exactly 1 iteration, so doing the check
+        -- for endtime at the end of the loop instead of the start.
+        while 1 = 1
         begin
             delete from @sweepresult;
             delete from @toassign;
@@ -230,6 +232,8 @@ as begin
 
                 select @i = @i + 1
             end
+
+            if sysutcdatetime() > @endtime break;
 
             waitfor delay @waitfor_arg;
         end

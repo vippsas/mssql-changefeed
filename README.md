@@ -21,3 +21,4 @@ use this library. You also need to set up a worker process that continually
 * [MOTIVATION.md - description of problem and review of competing solutions](MOTIVATION.md)
 * [USAGE.md - Usage instructions](USAGE.md)
 * [INSTALL.md - Installation instructions](INSTALL.md)
+* [CHANGELOG.md](CHANGELOG.md)
