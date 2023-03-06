@@ -18,12 +18,12 @@ import (
 // way to tell a timeout from a successful block and this design is intentional; the caller should
 // always do a full event read afterwards. This protects us against a full disaster if there are
 // bugs in the longpoll design.
-func Longpoll(ctx context.Context, dbc *sql.DB, feedID, shard int, timeout time.Duration, seenChangeSequenceNumber int) (err error) {
+func Longpoll(ctx context.Context, dbc *sql.DB, changefeedSchemaName string, feedID, shard int, timeout time.Duration, seenChangeSequenceNumber int) (err error) {
 	// DRY ... poll() sets the result variables in the enclosing scope and returns 'true' if we are to return...
 	poll := func() bool {
 		var seqno int
 		err = dbc.QueryRowContext(ctx,
-			`select last_change_sequence_number from changefeed.shard where feed_id = @p1 and shard = @p2`,
+			`select last_change_sequence_number from `+changefeedSchemaName+`.shard where feed_id = @p1 and shard = @p2`,
 			feedID, shard,
 		).Scan(&seqno)
 		return err != nil || seqno != seenChangeSequenceNumber
@@ -60,7 +60,7 @@ func Longpoll(ctx context.Context, dbc *sql.DB, feedID, shard int, timeout time.
 	go func(perr *error) {
 		defer wg.Done()
 
-		_, *perr = tx.ExecContext(ctx, `changefeed.longpoll`,
+		_, *perr = tx.ExecContext(ctx, changefeedSchemaName+`.longpoll`,
 			sql.Named("feed_id", feedID),
 			sql.Named("shard", shard),
 			sql.Named("change_sequence_number", seenChangeSequenceNumber),
@@ -77,7 +77,7 @@ func Longpoll(ctx context.Context, dbc *sql.DB, feedID, shard int, timeout time.
 	// before it gets to holding the lock...). This is taking another connection from the pool than the one
 	// we hold above.
 	var blocked bool
-	_, guardErr := dbc.ExecContext(ctx, "changefeed.longpoll_guard",
+	_, guardErr := dbc.ExecContext(ctx, changefeedSchemaName+".longpoll_guard",
 		sql.Named("transaction_id", transactionID),
 		sql.Named("blocked", sql.Out{Dest: &blocked}),
 	)
