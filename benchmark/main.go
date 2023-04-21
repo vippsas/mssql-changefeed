@@ -6,6 +6,7 @@ import (
 	"fmt"
 	_ "github.com/microsoft/go-mssqldb"
 	mssql "github.com/microsoft/go-mssqldb"
+	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -130,11 +131,9 @@ func sweep(ctx context.Context, dbi *sql.DB) {
 }
 
 func setup(ctx context.Context, dbi *sql.DB) {
-	/*for _, filename := range []string{
-		"../migrations/from0001/0001.changefeed.sql",
-		"../migrations/from0001/0002.changefeed.sql",
-		"../migrations/from0001/0003.changefeed.sql",
-		"../migrations/from0001/0004.changefeed.sql",
+	for _, filename := range []string{
+		"../migrations/2001.changefeed-v2.sql",
+		"benchmark-setup.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
@@ -152,35 +151,7 @@ func setup(ctx context.Context, dbi *sql.DB) {
 				panic(err)
 			}
 		}
-	}*/
-	for _, s := range []string{
-		//	`create schema benchmark;`,
-		`create table benchmark.Event(
-    EventID bigint not null identity(1,1) primary key,
-    Time datetime2(6) not null,
-    EventData varchar(max) not null,
-    change_id bigint not null
-);
-`,
-		`
-create unique index change_id on benchmark.Event(change_id);
-
-insert into changefeed.feed(feed_id, name, comment) values (1, 'Event', '');
-insert into changefeed.shard(feed_id, shard) values (1, 0);`, `
-
-create trigger t on benchmark.Event after insert as begin
-    set nocount on;
-    insert into changefeed.change (feed_id, shard, change_id)
-    select 1, 0, change_id from inserted;
-end;
-`,
-	} {
-		_, err := dbi.Exec(s)
-		if err != nil {
-			panic(err)
-		}
 	}
-	fmt.Println("success")
 }
 
 func insert(ctx context.Context, dbi *sql.DB) {

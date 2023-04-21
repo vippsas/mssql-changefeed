@@ -68,7 +68,9 @@ create procedure [changefeed].generate_ulid_blocking
   ( @feed_id uniqueidentifier
   , @shard_id int
   , @count int
-  , @time_hint datetime2(3) = null output
+  , @random_bytes binary(10) = null
+  , @time_hint datetime2(3) = null
+  , @time datetime2(3) = null output
   , @ulid binary(16) = null output
   , @ulid_prefix binary(8) = null output
   , @ulid_suffix bigint = null output
@@ -78,6 +80,7 @@ as begin
 
     if @count is null set @count = 1;
     if @time_hint is null set @time_hint = sysutcdatetime();
+    if @random_bytes is null set @random_bytes = crypt_gen_random(10);
 
     -- T-SQL primer, to be able to read the below code:
     -- 1) We are going to compute some expressions that depend on each other. To do this
@@ -92,7 +95,7 @@ as begin
     -- do the computation needed, and do the change, in a single B-tree lookup. Doing a `select` first
     -- then `update` later would need 2 lookups.
     update shard_state
-    set @time_hint = time = new_time
+    set @time = time = new_time
       , @ulid_prefix = ulid_prefix = new_ulid_prefix
       , @ulid_suffix = ulid_suffix_range_start
       , @ulid = new_ulid_prefix + convert(binary(8), ulid_suffix_range_start)
@@ -100,21 +103,21 @@ as begin
     from [changefeed].shard_v2 shard_state with (serializable, rowlock)
     cross apply (select
         new_time = iif(@time_hint > shard_state.time, @time_hint, shard_state.time)
-      , random_bytes = crypt_gen_random(10)
     ) let1
     cross apply (select
         new_ulid_prefix = (case
             when @time_hint > shard_state.time then
                 -- New timestamp, so generate new prefix. The prefix is simply the timestamp + 2 random bytes.
-                convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', new_time)) + substring(random_bytes, 1, 2)
+                convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', new_time)) + substring(@random_bytes, 1, 2)
             else
                 shard_state.ulid_prefix
             end)
       , ulid_suffix_range_start = (case
           when @time_hint > shard_state.time then
               -- Start suffix in new place.
-              -- TODO: Zero out bit
-              convert(bigint, substring(random_bytes, 3, 8)) & 0x7fffffffffffffff
+              -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
+              -- as the caller adds numbers to this
+              convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
           else
               -- We store the *last* ULID used in shard_state, so the start of the range
               -- we allocate now is +1.
@@ -139,20 +142,21 @@ as begin
             @feed_id = @feed_id
           , @shard_id = @shard_id
           , @count = @count
-          , @time_hint = @time_hint output
+          , @time_hint = @time_hint
+          , @random_bytes = @random_bytes
+          , @time = @time output
           , @ulid = @ulid output
           , @ulid_prefix = @ulid_prefix output
           , @ulid_suffix = @ulid_suffix output
     end
 end;
 
-
 go
-
 
 create procedure [changefeed].begin_ulid_transaction
   ( @feed_id uniqueidentifier
   , @shard_id int
+  , @timeout int = 100
   , @time_hint datetime2(3) = null output
   , @ulid_prefix binary(8) = null output
   , @ulid_suffix bigint = null output
@@ -162,8 +166,37 @@ as begin
 
     if @time_hint is null set @time_hint = sysutcdatetime();
 
-    declare @previous_time datetime2(3)
-    declare @random_bytes binary(10)
+    declare @msg nvarchar(max)
+    declare @lock_name nvarchar(255) = concat('changefeed/', @feed_id, '/', @shard_id);
+    declare @lock_result int
+
+    exec @lock_result = sp_getapplock
+        @Resource = @lock_name
+      , @LockMode = 'Exclusive'
+      , @LockOwner = 'Transaction'
+      , @LockTimeout = @timeout;
+    if @lock_result < 0
+    begin
+        if @lock_result = -1
+        begin
+            -- We have to assume that another session halted in the middle
+            -- (e.g., due to client-managed transaction and client power-off or disconnection).
+            -- Fall back to blocking, conservative mode. The only disadvantage of this mode
+            -- is that if there is *another* client power-off/disconnection
+            set @msg = concat('sp_getapplock result: ', @msg)
+            rollback;
+            throw 55103, @msg, 0;
+        end
+        else
+        begin
+            set @msg = concat('sp_getapplock result: ', @msg)
+            rollback;
+            throw 55103, @msg, 0;
+        end
+    end
+
+    declare @previous_time datetime2(3);
+    declare @random_bytes binary(10);
 
     select
         @ulid_prefix = ulid_prefix
@@ -185,11 +218,9 @@ as begin
         -- new timestamp; re-seed entropy
         set @random_bytes = crypt_gen_random(10);
         set @ulid_prefix = convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', @time_hint)) + substring(@random_bytes, 1, 2);
-        -- TODO: Zero out bit
-        set @ulid_suffix = convert(bigint, substring(@random_bytes, 3, 8)) & 0x7fffffffffffffff
+        -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
+        set @ulid_suffix = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
     end
-    declare @msg nvarchar(max) = concat('@time_hint=',@time_hint, ' @previous_time=', @previous_time)
-    raiserror (@msg, 0, 1) with nowait
 
     -- If there are several backend<->SQL transactions going on, it's hard to
     -- channel parameters to commit_ulid_transaction.
@@ -210,7 +241,6 @@ create procedure [changefeed].commit_ulid_transaction
 as begin
     declare @feed_id uniqueidentifier = convert(uniqueidentifier, session_context(N'changefeed.feed_id'));
     declare @shard_id int = convert(int, session_context(N'changefeed.shard_id'));
-    declare @count bigint = convert(bigint, session_context(N'changefeed.count'));
     declare @ulid_prefix binary(8) = convert(binary(8), session_context(N'changefeed.ulid_prefix'))
     declare @time datetime2(3) = convert(datetime2(3), session_context(N'changefeed.time'))
 
@@ -219,14 +249,11 @@ as begin
     update [changefeed].shard_v2
     set
         ulid_prefix = @ulid_prefix
-      , ulid_suffix = @ulid_suffix
+        -- for good measure, just add 1; so that @ulid_suffix can be passed inclusive or exclusive, doesn't matter..
+      , ulid_suffix = @ulid_suffix + 1
       , time = @time
     where
       feed_id = @feed_id and shard_id = @shard_id;
-
-    declare @count2 int = (select count(*) from [changefeed].shard_v2)
-    declare @msg nvarchar(max) = concat('committed', '@time=',@time, '@count=', @count2)
-    raiserror (@msg, 0, 1) with nowait
 end
 
 

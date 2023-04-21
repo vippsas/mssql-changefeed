@@ -61,7 +61,7 @@ func RowIteratorToSlice(rows *sql.Rows) (columns []string, result Rows) {
 		for i, _ := range columns {
 			switch v := rowValues[i].(type) {
 			case []uint8:
-				row = append(row, string(v))
+				row = append(row, fmt.Sprintf("0x%x", v))
 			case int64:
 				// we don't really know that the query column is int64, that's just how all ints are returned,
 				// and it's usually more convenient in tests with int

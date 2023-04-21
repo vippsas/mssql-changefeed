@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
-	mssql "github.com/denisenkom/go-mssqldb"
+	"github.com/gofrs/uuid"
 	"github.com/oklog/ulid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,6 +63,7 @@ func TestUlidBlocking(t *testing.T) {
 	var ulidPrefix []byte
 	var ulidSuffix int64
 	var ulidFull ulid.ULID
+	var outTime time.Time
 	tx, err := fixture.DB.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSnapshot})
 	require.NoError(t, err)
 
@@ -70,7 +71,9 @@ func TestUlidBlocking(t *testing.T) {
 		sql.Named("feed_id", "28d74278-ddb9-11ed-bcc5-23a7efd30b00"),
 		sql.Named("shard_id", 0),
 		sql.Named("count", 100),
-		sql.Named("time_hint", sql.Out{Dest: &timeHint}),
+		sql.Named("time_hint", timeHint),
+		sql.Named("random_bytes", []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
+		sql.Named("time", sql.Out{Dest: &outTime}),
 		sql.Named("ulid", sql.Out{Dest: &ulidFull}),
 		sql.Named("ulid_prefix", sql.Out{Dest: &ulidPrefix}),
 		sql.Named("ulid_suffix", sql.Out{Dest: &ulidSuffix}),
@@ -82,10 +85,14 @@ func TestUlidBlocking(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, referenceUlid[:6], ulidFull[:6])
 	assert.Equal(t, referenceUlid[:6], ulidPrefix[:6]) // remaining bytes are random...
+	assert.Equal(t, outTime.In(time.UTC), timeHint)
 
-	// Bit 63 of ulidSuffix should always be 0 (this requires re-running, 50% chance of being a test)
-	// TODO:
-	//assert.Equal(t, uint64(0), uint64(ulidSuffix)&(uint64(1)<<63))
+	// It is possible to add 2^62 to the ulidPrefix in mssql without overflow, even
+	// if random_bytes was 0xfff.
+	var result int64
+	require.NoError(t, tx.QueryRow(`select @p1 + @p2`, ulidSuffix, 0x4000000000000000).Scan(&result))
+	var expected uint64 = 0xbfffffffffffffff + 0x4000000000000000
+	assert.Equal(t, int64(expected), result)
 }
 
 func TestIntegerConversionMssqlAndGo(t *testing.T) {
@@ -103,13 +110,52 @@ func ulidToInt(u ulid.ULID) uint64 {
 	return binary.BigEndian.Uint64(u[8:16])
 }
 
+func TestExample(t *testing.T) {
+	ctx := context.Background()
+	_, err := fixture.DB.ExecContext(ctx, `
+create table dbo.MyEvent (
+    MyAggregateID bigint not null, 
+    Version int not null,
+    Datapoint1 int not null,
+    Datapoint2 varchar(max) not null,
+    ULID binary(16) not null
+);
+`)
+	require.NoError(t, err)
+
+	feedID := uuid.Must(uuid.FromString("72e4bbb8-dee8-11ed-8496-07598057ad16"))
+	shardID := 0
+
+	for k := 0; k != 2; k++ {
+		tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, nil)
+		require.NoError(t, err)
+		for i := 0; i != 3; i++ {
+			eventULID := tx.NextULID()
+			fmt.Printf("%s = 0x%x\n", eventULID, [16]byte(eventULID))
+			_, err = tx.ExecContext(ctx, `
+insert into dbo.MyEvent(MyAggregateID, Version, Datapoint1, Datapoint2, ULID)
+values (@i, @k, 42 * @i, 'hello', @ULID)
+`,
+				sql.Named("i", i),
+				sql.Named("k", k),
+				sql.Named("ULID", eventULID),
+			)
+			require.NoError(t, err)
+		}
+		require.NoError(t, tx.Commit())
+	}
+
+	sqltest.QueryDump(fixture.DB, `select * from dbo.MyEvent`)
+
+}
+
 func TestTransactionWrappers(t *testing.T) {
 	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
 	//var ulidPrefix []byte
 	//var ulidSuffix int64
 	//var ulidFull ulid.ULID
 
-	feedID := mssql.UniqueIdentifier{0x28, 0xd7, 0x42, 0x78, 0xdd, 0xb9, 0x11, 0xed, 0xb, 0xc5, 0x23, 0xa7, 0xef, 0xd3, 0x0b, 0x00}
+	feedID := uuid.Must(uuid.FromString("72e4bbb8-dee8-11ed-8496-07598057ad16"))
 	shardID := 242
 
 	tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})

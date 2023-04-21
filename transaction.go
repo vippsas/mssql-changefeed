@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/binary"
 	mssql "github.com/denisenkom/go-mssqldb"
+	"github.com/gofrs/uuid"
 	"github.com/oklog/ulid"
 	"sync"
 	"time"
@@ -94,7 +95,7 @@ func (tx *Transaction) Commit() error {
 declare @ulid_suffix_typed bigint = @ulid_suffix
 exec sp_set_session_context N'changefeed.ulid_suffix', @ulid_suffix_typed;
 	`,
-		sql.Named("ulid_suffix", tx.ulidSuffix),
+		sql.Named("ulid_suffix", int64(tx.ulidSuffix)),
 	)
 	if err != nil {
 		return err
@@ -135,7 +136,7 @@ type TransactionOptions struct {
 	TimeHint time.Time
 }
 
-func BeginTransaction(sqlDB Conner, ctx context.Context, feedID mssql.UniqueIdentifier, shardID int, options *TransactionOptions) (*Transaction, error) {
+func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shardID int, options *TransactionOptions) (*Transaction, error) {
 	var tx Transaction
 	var err error
 
@@ -145,7 +146,7 @@ func BeginTransaction(sqlDB Conner, ctx context.Context, feedID mssql.UniqueIden
 		timeHint = &timeHintValue
 	}
 
-	tx.feedID = feedID
+	tx.feedID = mssql.UniqueIdentifier(feedID)
 	tx.shardID = shardID
 
 	tx.conn, err = sqlDB.Conn(ctx)
