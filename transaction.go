@@ -4,11 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
-	"encoding/binary"
+	"fmt"
 	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/gofrs/uuid"
 	"github.com/oklog/ulid"
-	"sync"
+	"github.com/pkg/errors"
 	"time"
 )
 
@@ -27,31 +27,28 @@ type SQLTxMethods interface {
 // Transaction wraps a *sql.Tx to make sure that the ULID begin/commit functions
 // are run at the right point in time.
 type Transaction struct {
-	conn *sql.Conn
+	schema string
+	conn   *sql.Conn
 
-	// sql.Tx etc are safe to use concurrently, so least surprising if this is too
-	lock sync.Mutex
-
-	feedID     mssql.UniqueIdentifier
-	shardID    int
-	ulidPrefix [8]byte
-	ulidSuffix uint64 // TODO test that we scan 64th bit
-	time       *time.Time
+	feedID  mssql.UniqueIdentifier
+	shardID int
 }
 
 var _ SQLTxMethods = &Transaction{}
 var _ driver.Tx = &Transaction{}
 
-func (tx *Transaction) NextULID() ulid.ULID {
-	tx.lock.Lock()
-	defer tx.lock.Unlock()
+func (tx *Transaction) NextULID(ctx context.Context) (result ulid.ULID, err error) {
+	err = tx.conn.QueryRowContext(ctx,
+		fmt.Sprintf(`select [%s].ulid(next value for [%s].sequence)`, tx.schema, tx.schema),
+	).Scan(&result)
+	return
+}
 
-	var result [16]byte
-	copy(result[0:8], tx.ulidPrefix[:])
-	binary.BigEndian.PutUint64(result[8:16], tx.ulidSuffix)
-
-	tx.ulidSuffix++
-	return ulid.ULID(result)
+func (tx *Transaction) Time(ctx context.Context) (result time.Time, err error) {
+	err = tx.conn.QueryRowContext(ctx,
+		fmt.Sprintf(`select [%s].time()`, tx.schema),
+	).Scan(&result)
+	return
 }
 
 func (tx *Transaction) ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error) {
@@ -74,7 +71,7 @@ func (tx *Transaction) Commit() error {
 	ctx, cancel := context.WithTimeout(context.Background(), commitRollbackContextTimeout)
 	defer cancel()
 
-	// This code is a bit tricky! Here's the deal:
+	// This code used to be a bit tricky! Here's the deal:
 	// First, anything passed to the mssql driver that *takes a parameter* will cause
 	// the creation of a temporary stored procedure, which is then executed.
 	// However, it is not legal to call `commit` inside a stored procedure (which is
@@ -88,27 +85,10 @@ func (tx *Transaction) Commit() error {
 	// have a power-off in-between, we'd block other processes for a long time.
 	//
 	// Solution: "Smuggle" the parameters using sp_set_session_context.
-	// Most of the parameters are communicated by the functions themselves, but ulid_suffix
-	// changes and is set here.
-
-	_, err := tx.conn.ExecContext(ctx, `
-declare @ulid_suffix_typed bigint = @ulid_suffix
-exec sp_set_session_context N'changefeed.ulid_suffix', @ulid_suffix_typed;
-	`,
-		sql.Named("ulid_suffix", int64(tx.ulidSuffix)),
-	)
-	if err != nil {
-		return err
-	}
-
+	// This was rolled into the stored procedures -- so now it is rather simple..
 	_, errCommit := tx.conn.ExecContext(ctx, `
-declare @ulid_suffix bigint = convert(bigint, session_context(N'changefeed.ulid_suffix'))
-exec [changefeed].commit_ulid_transaction @ulid_suffix = @ulid_suffix;
-    `)
-	if errCommit != nil {
-		return errCommit
-	}
-	_, errCommit = tx.conn.ExecContext(ctx, `/* do not remove me */ commit`) // or else, commit will be interpreted as name of a stored procedure
+exec [`+tx.schema+`].commit_ulid_transaction;
+/* do not remove me */ commit`) // or else, commit will be interpreted as name of a stored procedure
 
 	errClose := tx.conn.Close()
 	if errCommit != nil {
@@ -134,6 +114,7 @@ func (tx *Transaction) Rollback() error {
 
 type TransactionOptions struct {
 	TimeHint time.Time
+	Schema   string
 }
 
 func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shardID int, options *TransactionOptions) (*Transaction, error) {
@@ -141,9 +122,16 @@ func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shard
 	var err error
 
 	var timeHint *time.Time
+
+	tx.schema = "changefeed"
 	if options != nil {
-		timeHintValue := options.TimeHint
-		timeHint = &timeHintValue
+		if options.TimeHint != (time.Time{}) {
+			timeHintValue := options.TimeHint
+			timeHint = &timeHintValue
+		}
+		if options.Schema != "" {
+			tx.schema = options.Schema
+		}
 	}
 
 	tx.feedID = mssql.UniqueIdentifier(feedID)
@@ -153,27 +141,64 @@ func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shard
 	if err != nil {
 		return nil, err
 	}
-	_, err = tx.conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+	err = tx.initTransaction(ctx, timeHint, 0)
 	if err != nil {
 		_ = tx.conn.Close()
 		return nil, err
 	}
-	var ulidPrefix []byte
-	var ulidSuffix int64
-
-	_, err = tx.conn.ExecContext(ctx, `[changefeed].begin_ulid_transaction`,
-		sql.Named("feed_id", feedID),
-		sql.Named("shard_id", shardID),
-		sql.Named("time_hint", timeHint),
-		sql.Named("ulid_prefix", sql.Out{Dest: &ulidPrefix}),
-		sql.Named("ulid_suffix", sql.Out{Dest: &ulidSuffix}),
-	)
-	if err != nil {
-		_ = tx.conn.Close()
-		return nil, err
-	}
-	copy(tx.ulidPrefix[:], ulidPrefix)
-	tx.ulidSuffix = uint64(ulidSuffix) // conversion of negative to positive is intended!
 
 	return &tx, nil
+}
+
+func (tx *Transaction) initTransaction(ctx context.Context, timeHint *time.Time, recursionDepth int) error {
+	var incidentDetected bool
+	var incidentCount int
+	var lockResult int
+
+	if recursionDepth == 10 {
+		return errors.New("changefeed: more than 10 'power-off' events during one request; this is not normal")
+	}
+
+	_, err := tx.conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+	if err != nil {
+		return err
+	}
+	
+	_, err = tx.conn.ExecContext(ctx, `[`+tx.schema+`].begin_ulid_driver_transaction`,
+		sql.Named("feed_id", tx.feedID),
+		sql.Named("shard_id", tx.shardID),
+		sql.Named("time_hint", timeHint),
+
+		sql.Named("incident_detected", sql.Out{Dest: &incidentDetected}),
+		sql.Named("incident_count", sql.Out{Dest: &incidentCount}),
+		sql.Named("lock_result", sql.Out{Dest: &lockResult}),
+	)
+	if lockResult == -1 {
+		// timeout
+		if incidentDetected {
+			// We "burn" the current application lock and move on to the next one in the sequence
+			_, err = tx.conn.ExecContext(ctx, `
+rollback; -- unlike commit, rollback can be in a batch with params...
+exec [changefeed].set_incident_count
+    @feed_id = @feed_id
+  , @shard_id = @shard_id
+  , @incident_count = @incident_count;
+`,
+				sql.Named("feed_id", tx.feedID),
+				sql.Named("shard_id", tx.shardID),
+				sql.Named("incident_count", incidentCount),
+			)
+			if err != nil {
+				return err
+			}
+
+			// recurse to try again
+			return tx.initTransaction(ctx, timeHint, recursionDepth+1)
+		} else {
+			return errors.New("changefeed: timeout, too long queue of other requests")
+		}
+	} else if lockResult < 0 {
+		return fmt.Errorf("changefeed: sql: sp_getapplock failed with code %d", lockResult)
+	}
+	return nil
 }

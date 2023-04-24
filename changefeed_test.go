@@ -56,45 +56,6 @@ func TestInsertShard(t *testing.T) {
 		sqltest.Query(fixture.DB, `select convert(varchar(max), feed_id), shard_id from [changefeed].shard_v2 order by feed_id, shard_id`))
 }
 
-func TestUlidBlocking(t *testing.T) {
-	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
-	require.NoError(t, err)
-
-	var ulidPrefix []byte
-	var ulidSuffix int64
-	var ulidFull ulid.ULID
-	var outTime time.Time
-	tx, err := fixture.DB.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSnapshot})
-	require.NoError(t, err)
-
-	_, err = tx.Exec(`[changefeed].generate_ulid_blocking`,
-		sql.Named("feed_id", "28d74278-ddb9-11ed-bcc5-23a7efd30b00"),
-		sql.Named("shard_id", 0),
-		sql.Named("count", 100),
-		sql.Named("time_hint", timeHint),
-		sql.Named("random_bytes", []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}),
-		sql.Named("time", sql.Out{Dest: &outTime}),
-		sql.Named("ulid", sql.Out{Dest: &ulidFull}),
-		sql.Named("ulid_prefix", sql.Out{Dest: &ulidPrefix}),
-		sql.Named("ulid_suffix", sql.Out{Dest: &ulidSuffix}),
-	)
-	require.NoError(t, err)
-
-	// Check that we get the timestamp generation right by comparing with a Go implementation
-	referenceUlid, err := ulid.New(ulid.Timestamp(timeHint), nil)
-	require.NoError(t, err)
-	assert.Equal(t, referenceUlid[:6], ulidFull[:6])
-	assert.Equal(t, referenceUlid[:6], ulidPrefix[:6]) // remaining bytes are random...
-	assert.Equal(t, outTime.In(time.UTC), timeHint)
-
-	// It is possible to add 2^62 to the ulidPrefix in mssql without overflow, even
-	// if random_bytes was 0xfff.
-	var result int64
-	require.NoError(t, tx.QueryRow(`select @p1 + @p2`, ulidSuffix, 0x4000000000000000).Scan(&result))
-	var expected uint64 = 0xbfffffffffffffff + 0x4000000000000000
-	assert.Equal(t, int64(expected), result)
-}
-
 func TestIntegerConversionMssqlAndGo(t *testing.T) {
 	// Just an experiment, not something that will/should regress
 	ctx := context.Background()
@@ -130,7 +91,8 @@ create table dbo.MyEvent (
 		tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, nil)
 		require.NoError(t, err)
 		for i := 0; i != 3; i++ {
-			eventULID := tx.NextULID()
+			eventULID, err := tx.NextULID(ctx)
+			require.NoError(t, err)
 			fmt.Printf("%s = 0x%x\n", eventULID, [16]byte(eventULID))
 			_, err = tx.ExecContext(ctx, `
 insert into dbo.MyEvent(MyAggregateID, Version, Datapoint1, Datapoint2, ULID)
@@ -150,10 +112,8 @@ values (@i, @k, 42 * @i, 'hello', @ULID)
 }
 
 func TestTransactionWrappers(t *testing.T) {
+	ctx := context.Background()
 	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
-	//var ulidPrefix []byte
-	//var ulidSuffix int64
-	//var ulidFull ulid.ULID
 
 	feedID := uuid.Must(uuid.FromString("72e4bbb8-dee8-11ed-8496-07598057ad16"))
 	shardID := 242
@@ -161,11 +121,18 @@ func TestTransactionWrappers(t *testing.T) {
 	tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
 	require.NoError(t, err)
 	// This is the transaction where we inserted the shard_v2; it should be zero-initiatialized
-	assert.Equal(t, 0, sqltest.QueryInt(tx, `select ulid_suffix from changefeed.shard_v2`))
+	assert.Equal(t, 0, sqltest.QueryInt(tx, `select ulid_low from changefeed.shard_ulid`))
 
-	ulid1 := tx.NextULID()
-	ulid2 := tx.NextULID()
-	ulid3 := tx.NextULID()
+	gotTime, err := tx.Time(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, timeHint, gotTime)
+
+	ulid1, err := tx.NextULID(ctx)
+	require.NoError(t, err)
+	ulid2, err := tx.NextULID(ctx)
+	require.NoError(t, err)
+	ulid3, err := tx.NextULID(ctx)
+	require.NoError(t, err)
 	assert.True(t, ulidToInt(ulid1)+1 == ulidToInt(ulid2))
 	assert.True(t, ulidToInt(ulid2)+1 == ulidToInt(ulid3))
 
@@ -173,25 +140,24 @@ func TestTransactionWrappers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Check state committed to DB
-	var gotUlidPrefix []byte
-	var gotUlidSuffix int64
-	var gotTime time.Time
+	var gotUlidHigh []byte
+	var gotUlidLow int64
 	require.NoError(t, fixture.DB.QueryRowContext(context.Background(),
-		`select ulid_prefix, ulid_suffix, time from changefeed.shard_v2 where feed_id = @p1 and shard_id = @p2`,
-		feedID, shardID).Scan(&gotUlidPrefix, &gotUlidSuffix, &gotTime))
-	assert.True(t, ulidToInt(ulid3)+1 == uint64(gotUlidSuffix))
-	assert.Equal(t, gotUlidPrefix[:], ulid3[0:8])
+		`select ulid_high, ulid_low, time from changefeed.shard_ulid where feed_id = @p1 and shard_id = @p2`,
+		feedID, shardID).Scan(&gotUlidHigh, &gotUlidLow, &gotTime))
+	assert.True(t, ulidToInt(ulid3)+1 == uint64(gotUlidLow))
+	assert.Equal(t, gotUlidHigh[:], ulid3[0:8])
 	assert.Equal(t, timeHint, gotTime)
 
 	// Continue next transaction from *same* timestamp -- should continue counting on the same range
 	tx, err = BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
 	require.NoError(t, err)
-	ulid4a := tx.NextULID()
+	ulid4a, err := tx.NextULID(ctx)
+	require.NoError(t, err)
 
-	fmt.Println(ulid3)
-	fmt.Println(ulid4a)
-
-	assert.True(t, ulidToInt(ulid3)+1 == ulidToInt(ulid4a))
+	// the +2 instead of +1 is because of extra sampling of the sequence ... keeping it instead of
+	// correcting as having a bit more space for good measure doesn't hurt
+	assert.True(t, ulidToInt(ulid3)+2 == ulidToInt(ulid4a))
 	// roll back!
 	err = tx.Rollback()
 	require.NoError(t, err)
@@ -199,8 +165,10 @@ func TestTransactionWrappers(t *testing.T) {
 	// Continue again, since we rolled back previously we should continue on the same range
 	tx, err = BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
 	require.NoError(t, err)
-	ulid4b := tx.NextULID()
-	assert.True(t, ulidToInt(ulid3)+1 == ulidToInt(ulid4b))
+	ulid4b, err := tx.NextULID(ctx)
+	require.NoError(t, err)
+	// +2: see above
+	assert.True(t, ulidToInt(ulid3)+2 == ulidToInt(ulid4b))
 	// roll back!
 	err = tx.Rollback()
 	require.NoError(t, err)
