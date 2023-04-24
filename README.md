@@ -168,7 +168,7 @@ does not let us build that.
 **Note:** If the use of a sequence is a problem, we could introduce an alternative
 interface `changefeed.ulid_row_number(row_number() over (order by ...))`.
 The disadvantage of such an interface is that one would need to manually
-track and signal the number of ULIDs generated.
+track the number of ULIDs generated across several statements.
 
 ## Still curious?
 

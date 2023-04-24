@@ -17,49 +17,66 @@
 create schema [changefeed];
 go
 
-create table [changefeed].shard_v2
+create table [changefeed].shard_ulid
   ( feed_id uniqueidentifier not null
   , shard_id int not null
   , time datetime2(3) not null
-        constraint def_shard_v2_time default '1970-01-01'
+        constraint def_shard_ulid_time default '1970-01-01'
 
-  -- We store the ULID split into 2 components of 64 bits each.
-  -- The first part has the timestamp and 2 random bytes; the latter
-  -- part is random, but one can use it as the basis of a sequence
-  -- to generate millions of IDs within the same timestamp.
-  -- Bit 63 always starts off as 0 to prevent overflow while doing this.
-  , ulid_prefix binary(8) not null
-        constraint def_shard_v2_ulid_prefix default 0x0
-  -- ulid_suffix is the value *after* the last ULID that was generated;
-  -- i.e., if you load state and the time is the same, you can use this
-  -- as the first ULID
-  , ulid_suffix bigint not null
-        constraint def_shard_v2_ulid_suffix default 0
+  -- See EXPERTS-GUIDE.md for description of ulid_prefix
+  -- and ulid_low.
+  , ulid_high binary(8) not null
+        constraint def_shard_ulid_ulid_prefix default 0x0
+  , ulid_low bigint not null
+        constraint def_shard_ulid_ulid_low default 0
   -- For convenience, the ulid is displayable directly. Also serves as documentation:
-  , ulid as ulid_prefix + convert(binary(8), ulid_suffix)
-  , constraint pk_shard_v2 primary key (feed_id, shard_id)
+  , ulid as ulid_high + convert(binary(8), ulid_low)
+  , constraint pk_shard_ulid primary key (feed_id, shard_id)
   );
 
 -- can't imagine locks escalating on this table, but would sure be in
 -- trouble if they did, so just for good measure:
-alter table [changefeed].shard_v2 set (lock_escalation = disable);
+alter table [changefeed].shard_ulid set (lock_escalation = disable);
+
+go
+
+create table [changefeed].incident_count
+  ( feed_id uniqueidentifier not null
+  , shard_id int not null
+  , incident_count int not null
+  );
+
+go
+
+create sequence changefeed.sequence as bigint
+    start with -9223372036854775808
+    increment by 1
+    cache 100000
+    no maxvalue;
 
 go
 
 -- insert_shard will ensure that a shard exists, without causing an error if it does
 create procedure [changefeed].insert_shard
-  ( @feed_id uniqueidentifier,
-    @shard_id int
+  ( @feed_id uniqueidentifier
+  , @shard_id int
+  , @incident_count int = 0
   )
 as begin
-    insert into [changefeed].shard_v2 (feed_id, shard_id)
+    insert into [changefeed].shard_ulid (feed_id, shard_id)
     select
         @feed_id
       , @shard_id
     where
         not exists (
-            select 1 from [changefeed].shard_v2 with (updlock, serializable, rowlock)
+            select 1 from [changefeed].shard_ulid with (updlock, serializable, rowlock)
             where feed_id = @feed_id and shard_id = @shard_id);
+    if @@rowcount = 1
+    begin
+        -- always inserted in transaction with shard_ulid, so don't need another if-exists check
+        insert into [changefeed].incident_count (feed_id, shard_id, incident_count)
+        values (@feed_id, @shard_id, @incident_count);
+    end
 end;
 
 go
@@ -72,8 +89,8 @@ create procedure [changefeed].generate_ulid_blocking
   , @time_hint datetime2(3) = null
   , @time datetime2(3) = null output
   , @ulid binary(16) = null output
-  , @ulid_prefix binary(8) = null output
-  , @ulid_suffix bigint = null output
+  , @ulid_high binary(8) = null output
+  , @ulid_low bigint = null output
   )
 as begin
     if @@trancount = 0 throw 77000, 'Please call generate_ulid_blocking in a database transaction, so that you avoid race conditions with consumers. See README.md.', 0;
@@ -96,38 +113,38 @@ as begin
     -- then `update` later would need 2 lookups.
     update shard_state
     set @time = time = new_time
-      , @ulid_prefix = ulid_prefix = new_ulid_prefix
-      , @ulid_suffix = ulid_suffix_range_start
-      , @ulid = new_ulid_prefix + convert(binary(8), ulid_suffix_range_start)
-      , ulid_suffix = ulid_suffix_range_end
+      , @ulid_high = ulid_high = new_ulid_high
+      , @ulid_low = ulid_low_range_start
+      , @ulid = new_ulid_high + convert(binary(8), ulid_low_range_start)
+      , ulid_low = ulid_low_range_end
     from [changefeed].shard_v2 shard_state with (serializable, rowlock)
     cross apply (select
         new_time = iif(@time_hint > shard_state.time, @time_hint, shard_state.time)
     ) let1
     cross apply (select
-        new_ulid_prefix = (case
+        new_ulid_high = (case
             when @time_hint > shard_state.time then
-                -- New timestamp, so generate new prefix. The prefix is simply the timestamp + 2 random bytes.
+                -- New timestamp, so generate new high. The high is simply the timestamp + 2 random bytes.
                 convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', new_time)) + substring(@random_bytes, 1, 2)
             else
-                shard_state.ulid_prefix
+                shard_state.ulid_high
             end)
-      , ulid_suffix_range_start = (case
+      , ulid_low_range_start = (case
           when @time_hint > shard_state.time then
-              -- Start suffix in new place.
+              -- Start low in new place.
               -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
               -- as the caller adds numbers to this
               convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
           else
               -- We store the *last* ULID used in shard_state, so the start of the range
               -- we allocate now is +1.
-              shard_state.ulid_suffix + 1
+              shard_state.ulid_low + 1
           end)
     ) let2
     cross apply (select
-        -- The result of this call allocates ULIDs in the range [ulid_suffix_range_start, ..., ulid_suffix_range_end),
+        -- The result of this call allocates ULIDs in the range [ulid_low_range_start, ..., ulid_low_range_end),
         -- i.e. endpoint is exclusive
-        ulid_suffix_range_end = ulid_suffix_range_start + @count
+        ulid_low_range_end = ulid_low_range_start + @count
     ) let3
     where
         feed_id = @feed_id and shard_id = @shard_id;
@@ -146,20 +163,161 @@ as begin
           , @random_bytes = @random_bytes
           , @time = @time output
           , @ulid = @ulid output
-          , @ulid_prefix = @ulid_prefix output
-          , @ulid_suffix = @ulid_suffix output
+          , @ulid_high = @ulid_high output
+          , @ulid_low = @ulid_low output
     end
 end;
 
 go
 
+create procedure [changefeed].acquire_lock_and_detect_incidents
+  ( @feed_id uniqueidentifier
+  , @shard_id int
+  , @timeout int = 1000
+  , @incident_detected bit = null output
+  , @incident_count int = null output
+  , @lock_result int = null output
+  )
+as begin
+    set xact_abort, nocount on
+
+    begin try
+        if @timeout < 100 throw 77100, '@timeout > 100 required', 0;
+
+        -- Get number of incidents => lock generation we are currently on.
+        -- This number will always be increased, and always increased in single-statement tranactions,
+        -- so safe to use readuncommitted. This is IMPORTANT because otherwise this will
+        -- start the snapshot transaction, which is too early.
+        set @incident_count = isnull(
+            (select incident_count
+            from [changefeed].incident_count with (readuncommitted)
+            where
+                feed_id = @feed_id and shard_id = @shard_id), 0);
+
+        set @incident_detected = 0;
+
+        declare @lock_name nvarchar(255) = concat('changefeed/', @incident_count, '/', @feed_id, '/', @shard_id);
+
+        -- First do a short, initial lock to figure out if we will actually be waiting
+        -- for a while; happy-day optimization. Hardcoded to 100ms.
+        exec @lock_result = sp_getapplock
+              @Resource = @lock_name
+            , @LockMode = 'Exclusive'
+            , @LockOwner = 'Transaction'
+            , @LockTimeout = 100;
+
+        if @lock_result = -1 and @timeout > 100
+        begin
+            -- Lock timed out. We want to detect if we have a long backlog, or if we are waiting
+            -- for a *single* thread to finish. To do this we sample the shard state before and after.
+            -- IMPORTANT: Needs to be readuncommitted; we want to read outside of any snapshot
+            -- transaction we may be in, and also avoid starting the snapshot at this point.
+            declare @sampled_ulid_high binary(8)
+            declare @sampled_ulid_low bigint
+            select
+                @sampled_ulid_high = ulid_high
+              , @sampled_ulid_low = ulid_low
+            from [changefeed].shard_ulid with (readuncommitted)
+            where
+                feed_id = @feed_id and shard_id = @shard_id;
+
+            -- Note: If we run before the shard state rows have been inserted, @sampled_ulid_high/low will be
+            -- null here. In that case we don't bother to try to do incident detection; it's a corner case
+            -- just when the shard is first written to.
+
+            set @timeout = @timeout - 100;
+            -- By if-test above, @timout is still positive
+
+            exec @lock_result = sp_getapplock
+                  @Resource = @lock_name
+                , @LockMode = 'Exclusive'
+                , @LockOwner = 'Transaction'
+                , @LockTimeout = @timeout;
+
+            if @lock_result = -1 and @sampled_ulid_high is not null
+            begin
+                -- Timed out *again*. Do we have an incident, or a long queue of waiters?
+                -- If ulid has not moved, set @incident_detected = 1.
+                select
+                    @incident_detected = iif(
+                        @sampled_ulid_high = ulid_high and @sampled_ulid_low = ulid_low
+                        , 1, 0)
+                from [changefeed].shard_ulid with (readuncommitted)
+                where
+                    feed_id = @feed_id and shard_id = @shard_id;
+
+                /*declare @msg nvarchar(max) = concat('second timeout, lock_name=', @lock_name, ' spid=', @@spid, ' incident=', @incident_detected, ' sample=', @sampled_ulid_low,
+                    ' new=', (                select
+                                                      ulid_low
+                                              from [changefeed].shard_ulid with (readuncommitted)
+                                              where
+                                                      feed_id = @feed_id and shard_id = @shard_id)
+                );
+
+                raiserror (@msg, 1, 1) with nowait;*/
+
+            end
+        end
+
+        if @incident_detected = 1 set @incident_count = @incident_count + 1;
+        if @incident_count is null set @incident_count = -1;
+
+        -- Then @lock_result is simply returned, whether it comes from the
+        -- 1st lock attempt or 2nd lock attempt is not important.
+
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        throw;
+    end catch
+end
+
+go
+
+create procedure [changefeed].set_incident_count
+  ( @feed_id uniqueidentifier
+  , @shard_id int
+  , @incident_count int
+  )
+as begin
+    set nocount, xact_abort  on;
+
+    if @@trancount > 0
+    begin
+        rollback;
+        throw 70101, 'Do NOT call register_incident in transaction', 1;
+    end
+
+    begin try
+        --declare @msg nvarchar(max) = concat('updating incident_count')
+        --raiserror (@msg, 1, 1) with nowait;
+
+        update [changefeed].incident_count
+        set
+            incident_count = @incident_count
+        where
+            feed_id = @feed_id
+            and shard_id = @shard_id
+            and incident_count < @incident_count;
+
+        --declare @msg nvarchar(max) = concat('update incident count ', @incident_count);
+        --raiserror (@msg, 1, 1) with nowait;
+
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        ;throw;
+    end catch
+end
+go
+
 create procedure [changefeed].begin_ulid_transaction
   ( @feed_id uniqueidentifier
   , @shard_id int
-  , @timeout int = 100
+  , @timeout int = 1000
   , @time_hint datetime2(3) = null output
-  , @ulid_prefix binary(8) = null output
-  , @ulid_suffix bigint = null output
+  , @ulid_high binary(8) = null output
+  , @ulid_low bigint = null output
   )
 as begin
     if @@trancount = 0 throw 55100, 'Please read the documentation and call commit_ulid_transaction in a *special kind of* database transaction.', 0;
@@ -199,8 +357,8 @@ as begin
     declare @random_bytes binary(10);
 
     select
-        @ulid_prefix = ulid_prefix
-      , @ulid_suffix = ulid_suffix
+        @ulid_high = ulid_high
+      , @ulid_low = ulid_low
       , @previous_time = time
     from [changefeed].shard_v2
     where
@@ -217,9 +375,9 @@ as begin
     begin
         -- new timestamp; re-seed entropy
         set @random_bytes = crypt_gen_random(10);
-        set @ulid_prefix = convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', @time_hint)) + substring(@random_bytes, 1, 2);
+        set @ulid_high = convert(binary(6), datediff_big(millisecond, '1970-01-01 00:00:00', @time_hint)) + substring(@random_bytes, 1, 2);
         -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
-        set @ulid_suffix = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
+        set @ulid_low = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
     end
 
     -- If there are several backend<->SQL transactions going on, it's hard to
@@ -229,28 +387,28 @@ as begin
     -- to commit_ulid_transaction.
     exec sp_set_session_context N'changefeed.feed_id', @feed_id;
     exec sp_set_session_context N'changefeed.shard_id', @shard_id;
-    exec sp_set_session_context N'changefeed.ulid_prefix', @ulid_prefix;
+    exec sp_set_session_context N'changefeed.ulid_high', @ulid_high;
     exec sp_set_session_context N'changefeed.time', @time_hint;
 end
 
 go
 
 create procedure [changefeed].commit_ulid_transaction
-  ( @ulid_suffix bigint = null
+  ( @ulid_low bigint = null
   )
 as begin
     declare @feed_id uniqueidentifier = convert(uniqueidentifier, session_context(N'changefeed.feed_id'));
     declare @shard_id int = convert(int, session_context(N'changefeed.shard_id'));
-    declare @ulid_prefix binary(8) = convert(binary(8), session_context(N'changefeed.ulid_prefix'))
+    declare @ulid_high binary(8) = convert(binary(8), session_context(N'changefeed.ulid_high'))
     declare @time datetime2(3) = convert(datetime2(3), session_context(N'changefeed.time'))
 
     if @@trancount = 0 or @feed_id is null throw 77001, 'Please read the documentation and call commit_ulid_transaction in a *special kind of* database transaction.', 0;
 
     update [changefeed].shard_v2
     set
-        ulid_prefix = @ulid_prefix
-        -- for good measure, just add 1; so that @ulid_suffix can be passed inclusive or exclusive, doesn't matter..
-      , ulid_suffix = @ulid_suffix + 1
+        ulid_high = @ulid_high
+        -- for good measure, just add 1; so that @ulid_low can be passed inclusive or exclusive, doesn't matter..
+      , ulid_low = @ulid_low + 1
       , time = @time
     where
       feed_id = @feed_id and shard_id = @shard_id;
