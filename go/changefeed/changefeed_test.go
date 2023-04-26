@@ -9,7 +9,7 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/vippsas/mssql-changefeed/sqltest"
+	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
 	"testing"
 	"time"
 
@@ -53,7 +53,7 @@ func TestInsertShard(t *testing.T) {
 			{"28D74278-DDB9-11ED-BCC5-23A7EFD30B00", 1},
 			{"28D74278-DDB9-11ED-BCC5-23A7EFD30B01", 0},
 		},
-		sqltest.Query(fixture.DB, `select convert(varchar(max), feed_id), shard_id from [changefeed].shard_v2 order by feed_id, shard_id`))
+		sqltest.Query(fixture.DB, `select convert(varchar(max), feed_id), shard_id from [changefeed].shard_ulid order by feed_id, shard_id`))
 }
 
 func TestIntegerConversionMssqlAndGo(t *testing.T) {
@@ -115,13 +115,13 @@ func TestTransactionWrappers(t *testing.T) {
 	ctx := context.Background()
 	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
 
-	feedID := uuid.Must(uuid.FromString("72e4bbb8-dee8-11ed-8496-07598057ad16"))
+	feedID := uuid.Must(uuid.FromString("3783faf0-e336-11ed-873f-7fc575a39d77"))
 	shardID := 242
 
 	tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
 	require.NoError(t, err)
-	// This is the transaction where we inserted the shard_v2; it should be zero-initiatialized
-	assert.Equal(t, 0, sqltest.QueryInt(tx, `select ulid_low from changefeed.shard_ulid`))
+	// This is the transaction where we inserted the shard_ulid; it should be zero-initiatialized
+	assert.Equal(t, 0, sqltest.QueryInt(tx, `select ulid_low from changefeed.shard_ulid where feed_id = @p1`, feedID))
 
 	gotTime, err := tx.Time(ctx)
 	require.NoError(t, err)

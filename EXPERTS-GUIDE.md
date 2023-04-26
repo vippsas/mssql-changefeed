@@ -165,6 +165,31 @@ that are used for In-memory OLTP tables. However, these are not available
 on Azure SQL Hyperscale. If they are made available, the library can be
 simplified.
 
+### Note about snapshot transactions
+
+Part of the challenge is to make it possible to run snapshot
+transactions; where the state of the database is set to when
+the transaction starts.
+
+The snapshot transaction doesn't *really* start when
+`begin transaction` is issued; it starts later when the first
+actual read that depends on snapshot is issued. For instance,
+a read with the option `with (readuncommitted)` did this.
+
+At first we tried exploiting this, so that one could get
+the application lock inside the transaction, owned by the
+transaction, and not worry about releasing it. However, this
+turned out to be fragile and in some cases (but not others)
+simply executing a stored procedure that does nothing would start
+the snapshot transaction, for instance.
+
+Even if we got this working, these cases made it clear that we
+would be depending on implementation specific behaviour. So:
+The final solution the locks are owned by `Session` and we have
+to take care to release them in all situations.
+
+
+
 ### Detecting that a power-off has happened 
 
 We will detect when poweroffs happen, and write those to a table
@@ -293,6 +318,39 @@ and is *also* bust at this moment. So, at this point we roll back the transactio
 and return an error.
 
 However, when the client retries, 
+
+
+
+
+
+
+
+### Notes
+
+Options include:
+
+* A: ULID generated in transaction
+* B: ULID generated post-transaction
+
+axis 2:
+
+* 1: ULID put in same table
+* 2: ULID put in another table
+
+
+
+A1: ongoing approach
+A2: 
+
+
+
+2 in general:
+
+- change_id to link?
+- 
+
+
+
 
 
 

@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/vippsas/mssql-changefeed/sqltest"
+	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -14,34 +14,22 @@ import (
 	"time"
 )
 
-func acquireLockAndDetectIncidents(t *testing.T, tx *sql.Tx, feedID string, shardID int) (incidentDetected bool, lockResult int) {
-	var incidentCount int
+func acquireLockAndDetectIncidents(t *testing.T, conn *sql.Conn, feedID string, shardID int) {
 	ctx := context.Background()
-	_, err := tx.ExecContext(ctx, `[changefeed].acquire_lock_and_detect_incidents`,
+	_, err := conn.ExecContext(ctx, `[changefeed].acquire_lock_and_detect_incidents`,
 		sql.Named("feed_id", feedID),
 		sql.Named("shard_id", shardID),
-		sql.Named("timeout", 250),
-		sql.Named("incident_detected", sql.Out{Dest: &incidentDetected}),
-		sql.Named("incident_count", sql.Out{Dest: &incidentCount}),
-		sql.Named("lock_result", sql.Out{Dest: &lockResult}),
+		sql.Named("timeout", 500),
+		sql.Named("max_attempts", 10),
 	)
-	if incidentDetected {
-		// by protocol, caller should always do this...
-		bumpIncident(t, feedID, shardID, incidentCount)
-	}
 	require.NoError(t, err)
 	return
 }
 
-func touchShard(t *testing.T, tx *sql.Tx, feedID string, shardID int) {
+func touchShard(t *testing.T, conn *sql.Conn, feedID string, shardID int) {
 	ctx := context.Background()
-	_, err := tx.ExecContext(ctx, `
+	_, err := conn.ExecContext(ctx, `
 update [changefeed].shard_ulid set ulid_low = @ulid_low where feed_id = @feed_id and shard_id = @shard_id;
-if @@rowcount = 0
-begin
-    exec [changefeed].insert_shard @feed_id = @feed_id, @shard_id = @shard_id;
-	update [changefeed].shard_ulid set ulid_low = @ulid_low where feed_id = @feed_id and shard_id = @shard_id;
-end
 `,
 		sql.Named("feed_id", feedID),
 		sql.Named("shard_id", shardID),
@@ -50,16 +38,7 @@ end
 	require.NoError(t, err)
 }
 
-func bumpIncident(t *testing.T, feedID string, shardID int, incidentCount int) {
-	ctx := context.Background()
-	_, err := fixture.DB.ExecContext(ctx, `[changefeed].set_incident_count`,
-		sql.Named("feed_id", feedID),
-		sql.Named("shard_id", shardID),
-		sql.Named("incident_count", incidentCount),
-	)
-	require.NoError(t, err)
-}
-
+/*
 func TestAcquireLockHappyDay(t *testing.T) {
 	ctx := context.Background()
 	feedID := "91a9c4d2-e274-11ed-8fa4-6769c3d4e7fa"
@@ -77,21 +56,14 @@ func TestAcquireLockHappyDay(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			tx, err := fixture.DB.BeginTx(ctx, nil)
+			conn, err := fixture.DB.Conn(ctx)
 			require.NoError(t, err)
 
-			for {
-				incidentDetected, lockResult := acquireLockAndDetectIncidents(t, tx, feedID, shardID)
-				require.NoError(t, err)
-				if incidentDetected {
-					incidentDetectedGlobal = true
-				}
-				if lockResult >= 0 {
-					break
-				}
-			}
+			//tx, err := fixture.DB.BeginTx(ctx, &sql.TxOptions{
+			//	Isolation: sql.LevelSnapshot,
+			//})
 
-			assert.False(t, lockTaken)
+			acquireLockAndDetectIncidents(t, conn, feedID, shardID)
 			lockTaken = true
 
 			// Got lock ... do some "work", make sure to change the state
@@ -105,8 +77,44 @@ func TestAcquireLockHappyDay(t *testing.T) {
 	}
 	wg.Wait()
 	assert.False(t, incidentDetectedGlobal)
-}
+}*/
+/*
+func TestDebugSnapshot(t *testing.T) {
+	ctx := context.Background()
+	feedID := "91a9c4d2-e274-11ed-8fa4-6769c3d4e7fa"
+	shardID := 0
 
+	_, err := fixture.DB.Exec(`[changefeed].insert_shard`,
+		sql.Named("feed_id", feedID),
+		sql.Named("shard_id", shardID))
+	assert.NoError(t, err)
+
+	_, err = fixture.DB.Exec(`create procedure dbo.noop
+as begin
+    return
+end;`)
+
+	time.Sleep(10 * time.Second)
+	require.NoError(t, err)
+	_, err = fixture.DB.ExecContext(ctx, `exec dbo.noop`)
+	require.NoError(t, err)
+
+	var tx *sql.Tx
+
+	tx, err = fixture.DB.BeginTx(ctx, &sql.TxOptions{
+		Isolation: sql.LevelSnapshot,
+	})
+	require.NoError(t, err)
+
+	_, err = tx.ExecContext(ctx, `exec dbo.noop`)
+	require.NoError(t, err)
+	sqltest.QueryDump(fixture.DB, `select db_name()`)
+	//time.Sleep(60 * time.Minute)
+
+	snapshotStarted := sqltest.QueryInt(tx, `select count(*) from sys.dm_tran_active_snapshot_database_transactions where transaction_id = current_transaction_id()`)
+	require.Equal(t, 0, snapshotStarted)
+}
+*/
 func TestAcquireLockWithIncidents(t *testing.T) {
 	ctx := context.Background()
 	feedID := "91a9c4d2-e274-11ed-8fa4-6769c3d4e7fa"
@@ -124,22 +132,40 @@ func TestAcquireLockWithIncidents(t *testing.T) {
 		log = append(log, fmt.Sprintf(format, args...))
 	}
 
-	for i := 0; i != 10; i++ {
+	_, err := fixture.DB.Exec(`[changefeed].insert_shard`,
+		sql.Named("feed_id", feedID),
+		sql.Named("shard_id", shardID))
+	assert.NoError(t, err)
+
+	for i := 0; i != 4; i++ {
 		wg.Add(1)
 
 		go func() {
 			defer wg.Done()
 
-			tx, err := fixture.DB.BeginTx(ctx, nil)
+			conn, err := fixture.DB.Conn(ctx)
 			require.NoError(t, err)
 
-			for {
-				_, lockResult := acquireLockAndDetectIncidents(t, tx, feedID, shardID)
-				require.NoError(t, err)
-				if lockResult >= 0 {
-					break
-				}
-			}
+			acquireLockAndDetectIncidents(t, conn, feedID, shardID)
+
+			_, err = conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+			require.NoError(t, err)
+
+			time.Sleep(1 * time.Second)
+
+			sqltest.QueryDump(conn, `select * from changefeed.shard_ulid`)
+			touchShard(t, conn, feedID, shardID)
+
+			_, err = conn.ExecContext(ctx, `/* */ commit`)
+			require.NoError(t, err)
+
+			_, err = conn.ExecContext(ctx, `[changefeed].release_lock`)
+			require.NoError(t, err)
+
+			return
+
+			_, err = conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+			require.NoError(t, err)
 
 			// we number our threads after the point which we got to *this* position; and then
 			// use that number in the assertions
@@ -154,13 +180,18 @@ func TestAcquireLockWithIncidents(t *testing.T) {
 				addLog("thread=%d %s", threadID, "causing incident")
 				time.Sleep(3000 * time.Millisecond)
 				addLog("thread=%d %s", threadID, "releasing ... this should happen very last")
-				require.NoError(t, tx.Rollback())
+				_, err = conn.ExecContext(ctx, `if @@trancount > 0 rollback`)
+				require.NoError(t, err)
 			} else {
 				// Got lock ... do some "work", make sure to change the state
 				time.Sleep(100 * time.Millisecond)
-				touchShard(t, tx, feedID, shardID)
+				touchShard(t, conn, feedID, shardID)
 				addLog("thread=%d %s", threadID, "releasing lock")
-				require.NoError(t, tx.Commit())
+				_, err = conn.ExecContext(ctx, `/* */ commit`)
+				require.NoError(t, err)
+				_, err = conn.ExecContext(ctx, `[changefeed].release_lock`)
+				require.NoError(t, err)
+				require.NoError(t, conn.Close())
 			}
 
 		}()

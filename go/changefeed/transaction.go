@@ -78,16 +78,16 @@ func (tx *Transaction) Commit() error {
 	// not balanced by a `begin transaction`, which is the case here). So,
 	// if we pass a parameter, we will not be able to call 'commit'.
 	//
-	// Then: It is extremely important that the call to commit_ulid_transaction
+	// Then: It is extremely important that the call to commit_transaction
 	// happens in the *same* network roundtrip to mssql as the commit; so that a sudden
 	// power-off will not affect that both of them always runs -- this is because
-	// the commit_ulid_transaction call will block other transactions, and if we then
+	// the commit_transaction call will block other transactions, and if we then
 	// have a power-off in-between, we'd block other processes for a long time.
 	//
 	// Solution: "Smuggle" the parameters using sp_set_session_context.
 	// This was rolled into the stored procedures -- so now it is rather simple..
 	_, errCommit := tx.conn.ExecContext(ctx, `
-exec [`+tx.schema+`].commit_ulid_transaction;
+exec [`+tx.schema+`].commit_transaction;
 /* do not remove me */ commit`) // or else, commit will be interpreted as name of a stored procedure
 
 	errClose := tx.conn.Close()
@@ -163,8 +163,8 @@ func (tx *Transaction) initTransaction(ctx context.Context, timeHint *time.Time,
 	if err != nil {
 		return err
 	}
-	
-	_, err = tx.conn.ExecContext(ctx, `[`+tx.schema+`].begin_ulid_driver_transaction`,
+
+	_, err = tx.conn.ExecContext(ctx, `[`+tx.schema+`].begin_driver_transaction`,
 		sql.Named("feed_id", tx.feedID),
 		sql.Named("shard_id", tx.shardID),
 		sql.Named("time_hint", timeHint),

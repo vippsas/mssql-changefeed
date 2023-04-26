@@ -172,29 +172,61 @@ end;
 
 go
 
+create procedure [changefeed].release_lock
+as begin
+    set xact_abort, nocount on
+    begin try
+        declare @lock_name nvarchar(255) = convert(nvarchar(255), session_context(N'changefeed.lock_name'))
+        if @lock_name is null throw 77103, 'release_lock called in a session where acquire_lock_and_detect_incidents has not been called', 0;
+
+        exec sp_releaseapplock @Resource = @lock_name, @LockOwner = 'Session';
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        ;throw;
+    end catch
+end
+
+go
+
 create procedure [changefeed].acquire_lock_and_detect_incidents
   ( @feed_id uniqueidentifier
   , @shard_id int
   , @timeout int = 1000
+  , @max_attempts int = 3
   , @incident_detected bit = null output  -- only set if lock_result = -1
   , @incident_count int = null output
   , @lock_result int = null output
   )
 as begin
     set xact_abort, nocount on
-
     begin try
-        if @timeout < 100 throw 77100, '@timeout > 100 required', 0;
+        if @@trancount > 0 throw 77101, 'please call [changefeed].acquire_lock_and_detect_incidents before starting transaction', 1;
+        if @timeout < 100 throw 77102, '@timeout >= 100 required', 0;  -- todo: consider @timeout = -1 all the way through...
+        if session_context(N'changefeed.lock_name') is not null throw 77103, 'acquire_lock_and_detect_incidents called, but session has already taken a lock', 0;
+
+        declare @msg nvarchar(max);
+        --= concat('@timeout=', @timeout);
+        --raiserror (@msg, 1, 1) with nowait
 
         -- Get number of incidents => lock generation we are currently on.
-        -- This number will always be increased, and always increased in single-statement tranactions,
-        -- so safe to use readuncommitted. This is IMPORTANT because otherwise this will
-        -- start the snapshot transaction, which is too early.
-        set @incident_count = isnull(
-            (select incident_count
-            from [changefeed].incident_count with (readuncommitted)
+        set @incident_count = (select incident_count
+            from [changefeed].incident_count
             where
-                feed_id = @feed_id and shard_id = @shard_id), 0);
+                feed_id = @feed_id and shard_id = @shard_id);
+
+        if @incident_count is null
+        begin
+            set @incident_count = 0;
+            -- no shard state, set it up
+            set transaction isolation level read committed
+            begin transaction
+                exec [changefeed].insert_shard
+                    @feed_id = @feed_id
+                  , @shard_id = @shard_id
+                  , @incident_count = 0;
+            commit
+        end
 
         set @incident_detected = 0;
 
@@ -205,41 +237,42 @@ as begin
         exec @lock_result = sp_getapplock
               @Resource = @lock_name
             , @LockMode = 'Exclusive'
-            , @LockOwner = 'Transaction'
-            , @LockTimeout = 100;
+            , @LockOwner = 'Session'
+            , @LockTimeout = 99;
 
-        if @lock_result = -1 and (@timeout > 100 or @timeout = -1)
+        if @lock_result = -1
         begin
             -- Lock timed out. We want to detect if we have a long backlog, or if we are waiting
             -- for a *single* thread to finish. To do this we sample the shard state before and after.
-            -- IMPORTANT: Needs to be readuncommitted; we want to read outside of any snapshot
-            -- transaction we may be in, and also avoid starting the snapshot at this point.
             declare @sampled_ulid_high binary(8)
             declare @sampled_ulid_low bigint
             select
                 @sampled_ulid_high = ulid_high
               , @sampled_ulid_low = ulid_low
-            from [changefeed].shard_ulid with (readuncommitted)
+            from [changefeed].shard_ulid
             where
                 feed_id = @feed_id and shard_id = @shard_id;
 
-            -- Note: If we run before the shard state rows have been inserted, @sampled_ulid_high/low will be
-            -- null here. In that case we don't bother to try to do incident detection; it's a corner case
-            -- just when the shard is first written to.
+            if @sampled_ulid_high is null
+                throw 77200, 'assertion failed, should not be possible as we insert the shard further up', 0;
 
-            if @timeout <> -1 set @timeout = @timeout - 100;
-            -- By if-test above, @timout is still positive
+            declare @timeout_2 int = @timeout - 99;
+            if @timeout_2 <= 0
+            begin
+                set @msg = concat('assertion failed, @timeout_2 should be positive... ', @timeout, ' ', @timeout_2);
+                throw 77200, @msg, 0;
+            end
 
             exec @lock_result = sp_getapplock
-                @Resource = @lock_name
-              , @LockMode = 'Exclusive'
-              , @LockOwner = 'Transaction'
-              , @LockTimeout = @timeout;
+                  @Resource = @lock_name
+                , @LockMode = 'Exclusive'
+                , @LockOwner = 'Session'
+                , @LockTimeout = @timeout_2;
 
-            if @lock_result = -1 and @sampled_ulid_high is not null
+            if @lock_result = -1
             begin
                 -- Timed out *again*. Do we have an incident, or a long queue of waiters?
-                -- If ulid has not moved, set @incident_detected = 1.
+                -- If ulid state has not changed in the time, judge it to be an incident.
                 select
                     @incident_detected = iif(
                         @sampled_ulid_high = ulid_high and @sampled_ulid_low = ulid_low
@@ -248,15 +281,58 @@ as begin
                 where
                     feed_id = @feed_id and shard_id = @shard_id;
 
+                if @incident_detected = 1
+                begin
+                    set @incident_count = @incident_count + 1;
+
+                    set @msg = concat('incident detected!, :', @incident_count)
+                    raiserror (@msg, 1, 1) with nowait;
+
+                    -- Many threads will do this update at once; but since they will only
+                    -- update if the current value is lower, only one of them will actually do the write.
+                    -- Rest will get @@rowcount = 0.
+                    update [changefeed].incident_count
+                    set
+                        incident_count = @incident_count
+                    where
+                      feed_id = @feed_id
+                      and shard_id = @shard_id
+                      and incident_count < @incident_count;
+
+                    if @max_attempts <= 0
+                    begin
+                        throw 77103, '[changefeed].acquire_lock_and_detect_incidents: timeout, and tried all attempts', 0;
+                    end
+                    else
+                    begin
+                        -- Recurse for next attempt
+                        declare @max_attempts_minus_one int = @max_attempts - 1;  -- gotta love T-SQL...
+                        exec [changefeed].acquire_lock_and_detect_incidents
+                             @feed_id = @feed_id
+                           , @shard_id = @shard_id
+                           , @timeout = @timeout
+                           , @max_attempts = @max_attempts_minus_one;
+
+                        -- At this point, either we have the lock (successful execution),
+                        -- and changefeed.lock_name has been set on the session; or, an
+                        -- error has been thrown.
+                        return
+                    end
+                end
             end
+            -- fall through, @lock_result <> -1 is handled the same for both levels of if-tests
         end
 
-        if @incident_detected = 1 set @incident_count = @incident_count + 1;
-        if @incident_count is null set @incident_count = -1;
-
-        -- Then @lock_result is simply returned, whether it comes from the
-        -- 1st lock attempt or 2nd lock attempt is not important.
-
+        -- At this point, @lock_result <> -1, and can come from either attempt at getting the lock
+        if @lock_result >= 0
+        begin
+            exec sp_set_session_context N'changefeed.lock_name', @lock_name;
+            return
+        end
+        else
+        begin
+            throw 77103, '[changefeed].acquire_lock_and_detect_incidents: error trying to get lock', @lock_result
+        end
     end try
     begin catch
         if @@trancount > 0 rollback;
@@ -297,7 +373,7 @@ as begin
 end
 go
 
-create procedure [changefeed].begin_ulid_driver_transaction
+create procedure [changefeed].begin_driver_transaction
   ( @feed_id uniqueidentifier
   , @shard_id int
   , @timeout int = 1000
@@ -309,7 +385,7 @@ create procedure [changefeed].begin_ulid_driver_transaction
 as begin
     set nocount, xact_abort on;
     begin try
-        if @@trancount = 0 throw 55100, 'Please read the documentation and call commit_ulid_transaction in a *special kind of* database transaction.', 0;
+        if @@trancount = 0 throw 55100, 'Please read the documentation and call commit_transaction in a *special kind of* database transaction.', 0;
 
         if @time_hint is null set @time_hint = sysutcdatetime();
 
@@ -360,10 +436,10 @@ as begin
         end
 
         -- If there are several backend<->SQL transactions going on, it's hard to
-        -- channel parameters to commit_ulid_transaction.
+        -- channel parameters to commit_transaction.
         -- See comment in transaction.go. So, while we are at it, just always use
         -- this method so that parameters don't have to be passed again
-        -- to commit_ulid_transaction.
+        -- to commit_transaction.
         declare @sequence_start bigint = next value for [changefeed].sequence;
         exec sp_set_session_context N'changefeed.feed_id', @feed_id;
         exec sp_set_session_context N'changefeed.shard_id', @shard_id;
@@ -381,7 +457,7 @@ end
 
 go
 
-create procedure [changefeed].begin_ulid_batch_transaction
+create procedure [changefeed].begin_batch_transaction
 ( @feed_id uniqueidentifier
 , @shard_id int
 , @timeout int = -1
@@ -393,7 +469,7 @@ as begin
         declare @lock_result int
         declare @incident_detected bit;
 
-        exec [changefeed].begin_ulid_driver_transaction
+        exec [changefeed].begin_driver_transaction
             @feed_id = @feed_id
           , @shard_id = @shard_id
           , @timeout = @timeout
@@ -435,7 +511,7 @@ end
 
 go
 
-create procedure [changefeed].commit_ulid_transaction
+create procedure [changefeed].commit_transaction
 as begin
     set nocount, xact_abort on
     begin try
@@ -447,8 +523,8 @@ as begin
         declare @sequence_start bigint = convert(bigint, session_context(N'changefeed.sequence_start'));
         declare @count bigint = (next value for [changefeed].sequence) - @sequence_start;
 
-        if @@trancount = 0 throw 77001, 'Please read the documentation and call commit_ulid_transaction in a *special kind of* database transaction (@trancount = 0)', 0;
-        if @feed_id is null throw 77002, 'Please read the documentation and call commit_ulid_transaction in a *special kind of* database transaction (no feed_id in session context).', 0;
+        if @@trancount = 0 throw 77001, 'Please read the documentation and call changefeed.commit_transaction in a *special kind of* database transaction (@trancount = 0)', 0;
+        if @feed_id is null throw 77002, 'Please read the documentation and call changefeed.commit_transaction in a *special kind of* database transaction (no feed_id in session context).', 0;
 
         update [changefeed].shard_ulid
         set
@@ -459,6 +535,13 @@ as begin
         where
             feed_id = @feed_id and shard_id = @shard_id;
 
+        exec sp_set_session_context N'changefeed.lock_name', null;
+        exec sp_set_session_context N'changefeed.feed_id', null;
+        exec sp_set_session_context N'changefeed.shard_id', null;
+        exec sp_set_session_context N'changefeed.ulid_high', null;
+        exec sp_set_session_context N'changefeed.ulid_low', null;
+        exec sp_set_session_context N'changefeed.time', null;
+        exec sp_set_session_context N'changefeed.sequence_start', null;
     end try
     begin catch
         if @@trancount > 0 rollback;

@@ -36,7 +36,7 @@ var fixture = Fixture{}
 
 func (f *Fixture) RunMigrations() {
 	for _, filename := range []string{
-		"migrations/2001.changefeed-v2.sql",
+		"../../migrations/2001.changefeed-v2.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
