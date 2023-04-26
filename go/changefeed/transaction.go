@@ -8,7 +8,6 @@ import (
 	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/gofrs/uuid"
 	"github.com/oklog/ulid"
-	"github.com/pkg/errors"
 	"time"
 )
 
@@ -88,7 +87,9 @@ func (tx *Transaction) Commit() error {
 	// This was rolled into the stored procedures -- so now it is rather simple..
 	_, errCommit := tx.conn.ExecContext(ctx, `
 exec [`+tx.schema+`].commit_transaction;
-/* do not remove me */ commit`) // or else, commit will be interpreted as name of a stored procedure
+/* do not remove me */ commit;
+exec [`+tx.schema+`].release_lock;
+`) // or else, commit will be interpreted as name of a stored procedure
 
 	errClose := tx.conn.Close()
 	if errCommit != nil {
@@ -141,7 +142,7 @@ func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shard
 	if err != nil {
 		return nil, err
 	}
-	err = tx.initTransaction(ctx, timeHint, 0)
+	err = tx.initTransaction(ctx, timeHint)
 	if err != nil {
 		_ = tx.conn.Close()
 		return nil, err
@@ -150,55 +151,23 @@ func BeginTransaction(sqlDB Conner, ctx context.Context, feedID uuid.UUID, shard
 	return &tx, nil
 }
 
-func (tx *Transaction) initTransaction(ctx context.Context, timeHint *time.Time, recursionDepth int) error {
-	var incidentDetected bool
-	var incidentCount int
-	var lockResult int
-
-	if recursionDepth == 10 {
-		return errors.New("changefeed: more than 10 'power-off' events during one request; this is not normal")
-	}
-
-	_, err := tx.conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+func (tx *Transaction) initTransaction(ctx context.Context, timeHint *time.Time) error {
+	_, err := tx.conn.ExecContext(ctx, `[`+tx.schema+`].begin_driver_transaction`,
+		sql.Named("feed_id", tx.feedID),
+		sql.Named("shard_id", tx.shardID),
+		sql.Named("time_hint", timeHint),
+		sql.Named("timeout", 10000),
+	)
 	if err != nil {
 		return err
 	}
 
-	_, err = tx.conn.ExecContext(ctx, `[`+tx.schema+`].begin_driver_transaction`,
-		sql.Named("feed_id", tx.feedID),
-		sql.Named("shard_id", tx.shardID),
-		sql.Named("time_hint", timeHint),
-
-		sql.Named("incident_detected", sql.Out{Dest: &incidentDetected}),
-		sql.Named("incident_count", sql.Out{Dest: &incidentCount}),
-		sql.Named("lock_result", sql.Out{Dest: &lockResult}),
-	)
-	if lockResult == -1 {
-		// timeout
-		if incidentDetected {
-			// We "burn" the current application lock and move on to the next one in the sequence
-			_, err = tx.conn.ExecContext(ctx, `
-rollback; -- unlike commit, rollback can be in a batch with params...
-exec [changefeed].set_incident_count
-    @feed_id = @feed_id
-  , @shard_id = @shard_id
-  , @incident_count = @incident_count;
-`,
-				sql.Named("feed_id", tx.feedID),
-				sql.Named("shard_id", tx.shardID),
-				sql.Named("incident_count", incidentCount),
-			)
-			if err != nil {
-				return err
-			}
-
-			// recurse to try again
-			return tx.initTransaction(ctx, timeHint, recursionDepth+1)
-		} else {
-			return errors.New("changefeed: timeout, too long queue of other requests")
-		}
-	} else if lockResult < 0 {
-		return fmt.Errorf("changefeed: sql: sp_getapplock failed with code %d", lockResult)
+	_, err = tx.conn.ExecContext(ctx, `set transaction isolation level snapshot; begin transaction;`)
+	if err != nil {
+		// best effort release_lock...
+		_, _ = tx.conn.ExecContext(ctx, `exec [`+tx.schema+`].release_lock`)
+		// ...and return original error
+		return err
 	}
 	return nil
 }

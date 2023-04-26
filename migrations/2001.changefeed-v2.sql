@@ -180,6 +180,8 @@ as begin
         if @lock_name is null throw 77103, 'release_lock called in a session where acquire_lock_and_detect_incidents has not been called', 0;
 
         exec sp_releaseapplock @Resource = @lock_name, @LockOwner = 'Session';
+
+        exec sp_set_session_context N'changefeed.lock_name', null;
     end try
     begin catch
         if @@trancount > 0 rollback;
@@ -194,9 +196,6 @@ create procedure [changefeed].acquire_lock_and_detect_incidents
   , @shard_id int
   , @timeout int = 1000
   , @max_attempts int = 3
-  , @incident_detected bit = null output  -- only set if lock_result = -1
-  , @incident_count int = null output
-  , @lock_result int = null output
   )
 as begin
     set xact_abort, nocount on
@@ -206,8 +205,15 @@ as begin
         if session_context(N'changefeed.lock_name') is not null throw 77103, 'acquire_lock_and_detect_incidents called, but session has already taken a lock', 0;
 
         declare @msg nvarchar(max);
-        --= concat('@timeout=', @timeout);
-        --raiserror (@msg, 1, 1) with nowait
+        declare @timeout_1st int;
+        declare @timeout_2nd int;
+        declare @incident_detected bit;
+        declare @incident_count int;
+        declare @lock_result int;
+
+        set @timeout_1st = 99;
+        set @timeout_2nd = @timeout - 99;
+
 
         -- Get number of incidents => lock generation we are currently on.
         set @incident_count = (select incident_count
@@ -256,18 +262,11 @@ as begin
             if @sampled_ulid_high is null
                 throw 77200, 'assertion failed, should not be possible as we insert the shard further up', 0;
 
-            declare @timeout_2 int = @timeout - 99;
-            if @timeout_2 <= 0
-            begin
-                set @msg = concat('assertion failed, @timeout_2 should be positive... ', @timeout, ' ', @timeout_2);
-                throw 77200, @msg, 0;
-            end
-
             exec @lock_result = sp_getapplock
                   @Resource = @lock_name
                 , @LockMode = 'Exclusive'
                 , @LockOwner = 'Session'
-                , @LockTimeout = @timeout_2;
+                , @LockTimeout = @timeout_2nd;
 
             if @lock_result = -1
             begin
@@ -284,9 +283,6 @@ as begin
                 if @incident_detected = 1
                 begin
                     set @incident_count = @incident_count + 1;
-
-                    set @msg = concat('incident detected!, :', @incident_count)
-                    raiserror (@msg, 1, 1) with nowait;
 
                     -- Many threads will do this update at once; but since they will only
                     -- update if the current value is lower, only one of them will actually do the write.
@@ -329,14 +325,19 @@ as begin
             exec sp_set_session_context N'changefeed.lock_name', @lock_name;
             return
         end
+        else if @lock_result = -1
+        begin
+            ;throw 77103, '[changefeed].acquire_lock_and_detect_incidents: timeout', 1;
+        end
         else
         begin
-            throw 77103, '[changefeed].acquire_lock_and_detect_incidents: error trying to get lock', @lock_result
+            set @msg = concat('[changefeed].acquire_lock_and_detect_incidents: error trying to get lock: ', @lock_result);
+            ;throw 77104, @msg, 1
         end
     end try
     begin catch
         if @@trancount > 0 rollback;
-        throw;
+        ;throw;
     end catch
 end
 
@@ -378,14 +379,11 @@ create procedure [changefeed].begin_driver_transaction
   , @shard_id int
   , @timeout int = 1000
   , @time_hint datetime2(3) = null
-  , @incident_detected bit = null output
-  , @incident_count int = null output
-  , @lock_result int = null output
   )
 as begin
     set nocount, xact_abort on;
     begin try
-        if @@trancount = 0 throw 55100, 'Please read the documentation and call commit_transaction in a *special kind of* database transaction.', 0;
+        if @@trancount > 0 throw 55100, 'Please read the documentation; begin_driver_transaction should be called *before* starting the transaction', 0;
 
         if @time_hint is null set @time_hint = sysutcdatetime();
 
@@ -396,12 +394,8 @@ as begin
         exec [changefeed].acquire_lock_and_detect_incidents
              @feed_id = @feed_id
            , @shard_id = @shard_id
-           , @timeout = @timeout
-           , @incident_detected = @incident_detected output
-           , @incident_count = @incident_count output
-           , @lock_result  = @lock_result output;
-
-        if @lock_result < 0 return;
+           , @timeout = @timeout;
+        -- at this point we have lock; because otherwise an error is thrown
 
         declare @previous_time datetime2(3);
         declare @random_bytes binary(10);
@@ -535,7 +529,6 @@ as begin
         where
             feed_id = @feed_id and shard_id = @shard_id;
 
-        exec sp_set_session_context N'changefeed.lock_name', null;
         exec sp_set_session_context N'changefeed.feed_id', null;
         exec sp_set_session_context N'changefeed.shard_id', null;
         exec sp_set_session_context N'changefeed.ulid_high', null;
