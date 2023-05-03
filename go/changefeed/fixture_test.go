@@ -37,6 +37,7 @@ var fixture = Fixture{}
 func (f *Fixture) RunMigrations() {
 	for _, filename := range []string{
 		"../../migrations/2001.changefeed-v2.sql",
+		"testdata/mytable.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
 		if err != nil {
@@ -70,6 +71,8 @@ delete from changefeed.shard_v2;
 `)))
 
 }
+
+var MyTableObjectID int
 
 func TestMain(m *testing.M) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -128,6 +131,11 @@ func TestMain(m *testing.M) {
 	}
 
 	fixture.RunMigrations()
+
+	err = fixture.DB.QueryRow(`select object_id('myservice.MyTable')`).Scan(&MyTableObjectID)
+	if err != nil {
+		panic(err)
+	}
 
 	code := m.Run()
 	os.Exit(code)
