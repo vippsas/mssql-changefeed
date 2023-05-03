@@ -133,10 +133,33 @@ to get into a state where a client-managed transaction that is abandoned (e.g.
 power-off of client) can stop the entire shard for 30-60 seconds (the SQL Server
 network connection timeout).
 
-This will never happen in a server-managed transaction (transaction withing single
+This should never happen in a server-managed transaction (transaction within single
 batch), so below the scenario is always a client-managed transaction. All the
 extra precautions are not needed for a server-managed transactions they
-don't really hurt either, and it is simpler to keep the library the same for all cases.
+don't really hurt either.
+
+### The basic, vulnerable version
+
+We keep a state table `changefeed.shard_ulid` with primary
+key `(feed_id, shard_id)` and data `(time, ulid_prefix, ulid_suffix)`.
+Then:
+```sql
+begin transaction
+update changefeed.shard_ulid ... -- <compute, read and write values>
+--- <return control to backend>
+commit
+```
+
+This has the effect of:
+a) Blocking all concurrent sessions on the `update`.
+b) 
+
+
+
+
+
+
+
 
 To keep the main section at the bottom readable, some components
 we will use are described first, and then it comes together in the
