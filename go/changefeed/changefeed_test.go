@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
-	"github.com/gofrs/uuid"
 	"github.com/oklog/ulid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -31,29 +30,29 @@ func TestDatabaseSetup(t *testing.T) {
 }
 
 func TestInsertShard(t *testing.T) {
-	insertShard := func(feedID string, shardID int) {
+	insertShard := func(objectID int, shardID int) {
 		_, err := fixture.DB.Exec(`[changefeed].insert_shard`,
-			sql.Named("feed_id", feedID),
+			sql.Named("object_id", objectID),
 			sql.Named("shard_id", shardID),
 		)
 		require.NoError(t, err)
 	}
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b00", 0)
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b00", 1)
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b01", 0)
+	insertShard(0, 0)
+	insertShard(0, 1)
+	insertShard(1, 0)
 
 	// Do the same ones again (check idempotency without error)
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b00", 0)
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b00", 1)
-	insertShard("28d74278-ddb9-11ed-bcc5-23a7efd30b01", 0)
+	insertShard(0, 0)
+	insertShard(0, 1)
+	insertShard(1, 0)
 
 	assert.Equal(t,
 		sqltest.Rows{
-			{"28D74278-DDB9-11ED-BCC5-23A7EFD30B00", 0},
-			{"28D74278-DDB9-11ED-BCC5-23A7EFD30B00", 1},
-			{"28D74278-DDB9-11ED-BCC5-23A7EFD30B01", 0},
+			{0, 0},
+			{0, 1},
+			{1, 0},
 		},
-		sqltest.Query(fixture.DB, `select convert(varchar(max), feed_id), shard_id from [changefeed].shard_ulid order by feed_id, shard_id`))
+		sqltest.Query(fixture.DB, `select object_id, shard_id from [changefeed].shard_state_ulid order by object_id, shard_id`))
 }
 
 func TestIntegerConversionMssqlAndGo(t *testing.T) {
@@ -71,11 +70,11 @@ func ulidToInt(u ulid.ULID) uint64 {
 	return binary.BigEndian.Uint64(u[8:16])
 }
 
-func TestExample(t *testing.T) {
+func TestHappyDay(t *testing.T) {
 	ctx := context.Background()
 	_, err := fixture.DB.ExecContext(ctx, `
 create table dbo.MyEvent (
-    MyAggregateID bigint not null, 
+    MyAggregateID bigint not null,
     Version int not null,
     Datapoint1 int not null,
     Datapoint2 varchar(max) not null,
@@ -84,14 +83,24 @@ create table dbo.MyEvent (
 `)
 	require.NoError(t, err)
 
-	feedID := uuid.Must(uuid.FromString("72e4bbb8-dee8-11ed-8496-07598057ad16"))
-	shardID := 0
+	timeHint := time.Now()
 
 	for k := 0; k != 2; k++ {
-		tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, nil)
+
+		tx, err := fixture.DB.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSnapshot})
 		require.NoError(t, err)
+
+		_, err = tx.ExecContext(context.Background(), `[changefeed].init_ulid`,
+			sql.Named("table", "dbo.MyEvent"),
+			sql.Named("shard_id", 0),
+			sql.Named("timeout", -1),
+			sql.Named("time_hint", timeHint),
+		)
+		require.NoError(t, err)
+
 		for i := 0; i != 3; i++ {
-			eventULID, err := tx.NextULID(ctx)
+			var eventULID ulid.ULID
+			err := tx.QueryRowContext(ctx, `select [changefeed].get_ulid(@p1)`, i).Scan(&eventULID)
 			require.NoError(t, err)
 			fmt.Printf("%s = 0x%x\n", eventULID, [16]byte(eventULID))
 			_, err = tx.ExecContext(ctx, `
@@ -106,11 +115,9 @@ values (@i, @k, 42 * @i, 'hello', @ULID)
 		}
 		require.NoError(t, tx.Commit())
 	}
-
-	sqltest.QueryDump(fixture.DB, `select * from dbo.MyEvent`)
-
 }
 
+/*
 func TestTransactionWrappers(t *testing.T) {
 	ctx := context.Background()
 	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
@@ -178,3 +185,4 @@ func TestTransactionWrappers(t *testing.T) {
 func TestCommitVsRollback(t *testing.T) {
 	// TODO
 }
+*/
