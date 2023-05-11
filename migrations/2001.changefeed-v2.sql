@@ -259,7 +259,6 @@ as begin
         -- being able to block a partition. Take a lock with a timeout, and if it times out, kill
         -- the session having the lock...
         declare @lock_result int
-        declare @kill_count int
         exec [changefeed].lock_shard @object_id = @object_id, @shard_id = @shard_id, @timeout = @timeout, @result = @lock_result output
         if @lock_result = -1
         begin
@@ -284,6 +283,51 @@ as begin
         -- @lock_result is positive! We are past the guard for sudden pod power-offs, and can proceed
         -- with the rest of the logic. Lock is owned by transaction so will be automatically released.
 
+        exec [changefeed].private_core_init_ulid
+            @object_id = @object_id
+          , @shard_id = @shard_id
+          , @time_hint = @time_hint
+          , @random_bytes = @random_bytes
+          , @count = @count
+          , @time = @time output
+          , @ulid_high = @ulid_high output
+          , @ulid_low = @ulid_low output;
+
+        set @ulid = @ulid_high + convert(binary(8), @ulid_low);
+        set @did_timeout = 0;
+
+        -- Set some session context variables that will be used by [changefeed].get_ulid; for convenience.
+        exec sp_set_session_context N'changefeed.ulid_high', @ulid_high;
+        exec sp_set_session_context N'changefeed.ulid_low', @ulid_low;
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        ;throw;
+    end catch
+
+end;
+
+go
+
+create procedure [changefeed].private_core_init_ulid
+  ( @object_id int = null
+  , @shard_id int = 1
+  , @time_hint datetime2(3)
+  , @random_bytes binary(10)
+  , @count bigint = 68719476736  -- 1 TB of ULIDs...
+
+  , @time datetime2(3) = null output
+  , @ulid_high binary(8) = null output
+  , @ulid_low bigint = null output
+  )
+as begin
+    set nocount, xact_abort on
+
+    begin try
+        declare @msg nvarchar(max)
+
+        if @@trancount = 0 throw 77300, 'Do not call private_core_init_ulid directly', 0;
+
         -- T-SQL primer, to be able to read the below code:
         -- 1) We are going to compute some expressions that depend on each other. To do this
         --    we use the `cross apply` clause. This construct similarly to a `let` clause in
@@ -300,7 +344,6 @@ as begin
         set @time = time = new_time
           , @ulid_high = ulid_high = new_ulid_high
           , @ulid_low = ulid_low_range_start
-          , @ulid = new_ulid_high + convert(binary(8), ulid_low_range_start)
           , ulid_low = ulid_low_range_end
         from [changefeed].shard_state_ulid shard_state with (serializable, rowlock)
         cross apply (select
@@ -339,29 +382,24 @@ as begin
             -- Note: In the event that @@rowcount = 0, then no @variables will have been changed by
             -- the above `update` statement. So we start from scratch.
             exec [changefeed].insert_shard @object_id = @object_id, @shard_id = @shard_id;
+
             -- Try again
-            exec [changefeed].init_ulid
+            exec [changefeed].private_core_init_ulid
                 @object_id = @object_id
               , @shard_id = @shard_id
               , @count = @count
               , @time_hint = @time_hint
               , @random_bytes = @random_bytes
               , @time = @time output
-              , @ulid = @ulid output
               , @ulid_high = @ulid_high output
-              , @ulid_low = @ulid_low output
-        end
-        else
-        begin
-            -- Set some session context variables that will be used by [changefeed].get_ulid; for convenience.
-            exec sp_set_session_context N'changefeed.ulid_high', @ulid_high;
-            exec sp_set_session_context N'changefeed.ulid_low', @ulid_low;
-        end
+              , @ulid_low = @ulid_low output;
+            end
 
     end try
     begin catch
+        if @@trancount > 0 rollback;
+        ;throw;
     end catch
-
 end;
 
 go

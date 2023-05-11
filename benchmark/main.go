@@ -132,7 +132,7 @@ func sweep(ctx context.Context, dbi *sql.DB) {
 
 func setup(ctx context.Context, dbi *sql.DB) {
 	for _, filename := range []string{
-		"../migrations/2001.changefeed-v2.sql",
+		// "../migrations/2001.changefeed-v2.sql",
 		"benchmark-setup.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
@@ -149,6 +149,10 @@ func setup(ctx context.Context, dbi *sql.DB) {
 					fmt.Println(e2.All)
 				}
 				panic(err)
+			} else {
+				fmt.Println("===okvvv")
+				fmt.Println(p)
+				fmt.Println("===ok^^^")
 			}
 		}
 	}
@@ -179,12 +183,13 @@ begin tran;
     
 declare @result int;
 
-exec @result = sp_getapplock @Resource = 'MyLock', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1
-if @result < 0
-    throw 55001, 'did not get lock', 1;
+--exec @result = sp_getapplock @Resource = 'MyLock', @LockMode = 'Exclusive', @LockOwner = 'Transaction', @LockTimeout = -1
+--if @result < 0
+--    throw 55001, 'did not get lock', 1;
 
-insert into benchmark.Event(Time, EventData, change_id)
-values (@p1, @p2, next value for changefeed.change_id);
+insert into benchmark.Event(Time, JsonData, Shard, EventID)
+values (@p1, @p2, 0, null);
+
 
 commit
 
@@ -216,7 +221,11 @@ commit
 		for {
 			<-stats
 			count++
-			rate := int(int64(count-lastCount) * 1000 / time.Now().Sub(t0).Milliseconds())
+			dt := time.Now().Sub(t0).Milliseconds()
+			if dt == 0 {
+				continue
+			}
+			rate := int(int64(count-lastCount) * 1000 / dt)
 			if count%1000 == 0 {
 				fmt.Printf("count=%d  rate=%d\n", count, rate)
 				t0 = time.Now()
