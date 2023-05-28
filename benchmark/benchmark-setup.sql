@@ -16,6 +16,7 @@ create table myservice.Event(
     Time datetime2(3) not null,
     Shard int not null,
     JsonData varchar(max) not null,
+
     primary key (AggregateID, Sequence)
 );
 

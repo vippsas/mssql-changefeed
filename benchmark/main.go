@@ -7,6 +7,7 @@ import (
 	"github.com/gofrs/uuid"
 	_ "github.com/microsoft/go-mssqldb"
 	mssql "github.com/microsoft/go-mssqldb"
+	_ "github.com/microsoft/go-mssqldb/azuread"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -34,8 +35,26 @@ var _ mssql.Logger = StdoutLogger{}
 func main() {
 	//dsn := "sqlserver://127.0.0.1?database=foo&user id=foouser&password=FooPasswd1&log=63"
 	dsn := "sqlserver://127.0.0.1?database=foo&user id=foouser&password=FooPasswd1&log=63"
+	//dsn := "sqlserver://dagss-benchmark.database.windows.net?database=dagss-benchmark"
 	//mssql.SetLogger(StdoutLogger{})
 
+	/*connector, err := mssql.NewAccessTokenConnector(dsn, func() (string, error) {
+		cred, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return "", err
+		}
+		opts := policy.TokenRequestOptions{Scopes: []string{"https://database.windows.net/"}}
+		tk, err := cred.GetToken(context.Background(), opts)
+		if err != nil {
+			return "", err
+		}
+		return tk.Token, nil
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	dbi := sql.OpenDB(connector)*/
 	dbi, err := sql.Open("sqlserver", dsn)
 	if err != nil {
 		panic(err)

@@ -57,6 +57,7 @@ func (f *Fixture) RunMigrations() {
 						fmt.Printf("Line %d: %s\n", lineno+int(e.LineNo), e.Message)
 					}
 				}
+				panic(err)
 			}
 			lineno += strings.Count(p, "\n") + 2
 		}
@@ -67,7 +68,7 @@ func (f *Fixture) Reset(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	require.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `
-delete from changefeed.shard_v2;
+delete from changefeed.shard_state;
 `)))
 
 }
