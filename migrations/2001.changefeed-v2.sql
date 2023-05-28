@@ -30,26 +30,145 @@ alter table [changefeed].shard_state set (lock_escalation = disable);
 
 go
 
-create function [changefeed].gen_read_feed_sql(
+create function [changefeed].sql_unquoted_qualified_table_name(@object_id int)
+returns nvarchar(max)
+as begin
+    return (select concat(s.name, N'.', o.name)
+    from sys.objects as o
+             join sys.schemas as s on o.schema_id = s.schema_id
+    where o.object_id = @object_id);
+end;
+
+
+go
+
+create function [changefeed].sql_outbox_table_name(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max)
+as begin
+    return concat(
+        quotename(@changefeed_schema),
+        '.',
+        quotename(concat('outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
+end
+
+-- https://stackoverflow.com/questions/10977483/extended-type-name-function-that-includes-datalength
+
+go
+
+create function [changefeed].sql_fully_quoted_name(@object_id int)
+returns nvarchar(max)
+as begin
+    return concat(
+        quotename(object_schema_name(@object_id)),
+        '.',
+        quotename(object_name(@object_id)));
+end
+
+go
+
+create function [changefeed].sql_primary_key_columns_joined_by_comma(
+    @object_id int,
+    @prefix nvarchar(max)  -- for instance, 'tablealias.'; to put this in front of every column
+)
+returns nvarchar(max)
+as begin
+    return (select
+        string_agg(concat(@prefix, col.name), ', ') within group (order by col.column_id)
+    from sys.key_constraints as pk
+    join sys.index_columns as ic on
+        ic.index_id = pk.unique_index_id
+        and ic.object_id = pk.parent_object_id
+    join sys.columns as col on
+        col.object_id = pk.parent_object_id
+        and col.column_id = ic.index_column_id
+    where
+        pk.parent_object_id = @object_id
+        and pk.type = 'PK');
+end
+
+go
+
+create function [changefeed].sql_primary_key_column_declarations(@object_id int, @prefix nvarchar(max))
+returns nvarchar(max)
+as begin
+    -- returns a list of column declarations for the primary key of the given table;
+    --     x int not null,
+    --     y varchar(max) not null
+    -- This requires us to construct a query and hand it to sys.dm_exec_describe_first_result_set
+    declare @qry nvarchar(max) = concat(
+        'select ',
+        [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''),
+        ' from ',
+        [changefeed].sql_fully_quoted_name(@object_id))
+    return (
+        select
+            string_agg(
+                concat(
+                    @prefix, r.name, ' ', r.system_type_name,
+                    iif(collation_name is not null, concat(' collate ', r.collation_name), ''),
+                    ' not null'),
+                concat(',', char(10)))
+                within group (order by r.column_ordinal)
+    from sys.dm_exec_describe_first_result_set(@qry, null, 0) r
+    )
+end
+
+go
+
+create function [changefeed].sql_create_feed_table(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max)
+as begin
+    declare @table nvarchar(max) = concat(
+        quotename(@changefeed_schema),
+        '.',
+        quotename(concat('feed:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
+    declare @pkname nvarchar(max) = quotename(concat('pk:feed:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
+    return concat('create table ', @table, '(
+    shard int not null,
+    ulid binary(16) not null,
+', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
+    constraint ', @pkname, ' primary key (shard, ulid)
+) with (data_compression = page)');
+end
+
+go
+
+create function [changefeed].sql_create_outbox_table(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max)
+as begin
+    declare @table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
+    declare @pkname nvarchar(max) = quotename(concat('pk:outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
+    return concat('create table ', @table, '(
+    shard int not null,
+    time_hint datetime2(3) not null,
+    order_after_time bigint not null,
+', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
+    constraint ', @pkname, ' primary key (shard, time_hint, order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, ''), ')
+) with (data_compression = page)');
+end
+
+go
+
+create function [changefeed].sql_create_read_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
 )
 returns nvarchar(max) as begin
-    declare @table nvarchar(max) = concat(
-        quotename(object_schema_name(@object_id)),
-        '.',
-        quotename(object_name(@object_id)))
-
     -- re-generate table name in a certain format from sys tables;
     -- @table_name can be quoted in different ways. We use unquoted, but qualified,
     -- name; e.g. [myschema.with.dot].[table.with.dot] will turn into
     -- myschema.with.dot.table.with.dot. In theory this can be ambigious, but assume
     -- noone will use names like this.
-    declare @unquoted_qualified_table_name nvarchar(max) = (
-        select concat(s.name, N'.', o.name)
-        from sys.objects as o
-                 join sys.schemas as s on o.schema_id = s.schema_id
-        where o.object_id = @object_id);
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
 
     declare @feed_table nvarchar(max) = concat(
         quotename(@changefeed_schema),
@@ -79,9 +198,14 @@ as begin
 
         delete from #read;
 
-        insert into #read
-        select top(@pagesize) ULID, AggregateID, Sequence from ', @feed_table, '
-        where ULID > @cursor;
+        insert into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''),')
+        select top(@pagesize)
+            ulid,
+            ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), '
+        from ', @feed_table, '
+        where
+            shard = @shard
+            and ulid > @cursor;
 
         if @@rowcount <> 0
         begin
@@ -112,15 +236,16 @@ as begin
         -- @lockresult = 0; got lock without waiting. Consume outbox.
 
         declare @takenFromOutbox as table (
-            AggregateID uniqueidentifier not null,
-            Sequence int not null,
-            Time datetime2(3) not null
-        );
+        time_hint datetime2(3) not null,
+        order_after_time bigint not null,
+', [changefeed].sql_primary_key_column_declarations(@object_id, '        '), '
+);
 
-        delete top(@pagesize) from outbox
-        output
-           deleted.AggregateID, deleted.Sequence, deleted.Time into @takenFromOutbox
-        from ', @outbox_table, ' as outbox
+                          delete top(@pagesize) from outbox
+                          output
+', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), ', deleted.time_hint, deleted.order_after_time
+                             into @takenFromOutbox
+                          from ', @outbox_table, ' as outbox
         where outbox.Shard = @shard;
 
         if @@rowcount = 0
@@ -134,7 +259,7 @@ as begin
         declare @max_time datetime2(3);
         declare @count bigint;
         declare @random_bytes binary(10) = crypt_gen_random(10);
-        select @min_time = min(Time), @max_time = max(Time), @count = count(*) from @takenFromOutbox;
+        select @min_time = min(time_hint), @max_time = max(time_hint), @count = count(*) from @takenFromOutbox;
 
         -- To assign ULIDs to the events in @takenFromOutbox, we split into two cases:
         -- 1) The ones where time is <= shard_state.time. For this, the Time is adjusted up to the shard_state.time.
@@ -200,17 +325,16 @@ as begin
             values (@shard, @max_time, @ulid_high_next_time, @ulid_low_next_time);
         end
 
-        insert into myservice.EventFeed (Shard, ULID, AggregateID, Sequence)
-        output inserted.ULID, inserted.AggregateID, inserted.Sequence into #read
+        insert into ', @feed_table, '(shard, ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, '') , ')
+        output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), ')
         select
             @shard,
-            let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.Time, taken.Sequence)),
-            taken.AggregateID,
-            taken.Sequence
+            let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.time_hint, taken.order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), ')),
+            ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), '
         from @takenFromOutbox as taken
         cross apply (select
-            ulid_high = iif(@current_time is null or taken.Time > @current_time, @ulid_high_next_time, @ulid_high_current_time),
-            ulid_low = iif(@current_time is null or taken.Time > @current_time, @ulid_high_next_time, @ulid_low_current_time)
+            ulid_high = iif(@current_time is null or taken.time_hint > @current_time, @ulid_high_next_time, @ulid_high_current_time),
+            ulid_low = iif(@current_time is null or taken.time_hint > @current_time, @ulid_high_next_time, @ulid_low_current_time)
         ) let;
 
         commit
@@ -238,9 +362,17 @@ as begin
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
     declare @changefeed_schema nvarchar(max) = substring(@quoted_changefeed_schema, 2, len(@quoted_changefeed_schema) - 2);
 
-    declare @sql nvarchar(max) = [changefeed].gen_read_feed_sql(
+    -- create [feed:<tablename>]
+    declare @sql nvarchar(max) = [changefeed].sql_create_feed_table(
+            @object_id,
+            @changefeed_schema);
+
+    exec sp_executesql @sql;
+
+    -- create [read:<tablename>]
+    set @sql = [changefeed].sql_create_read_procedure(
         @object_id,
         @changefeed_schema);
 
-    exec sp_executesql @sql
+    exec sp_executesql @sql;
 end

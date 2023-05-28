@@ -1,12 +1,16 @@
-# mssql-changefeed v2: Changefeed SQL library for SQL Server
+# mssql-changefeed: Changefeed SQL library for SQL Server
 
-Note: Version 1 used a rather different approach. It is
-still available on the [v1 branch](TODO).
+## The reusable outbox pattern
 
-### On ULIDs
+The Outbox pattern is often used to make sure that events are exported
+to an event broker if and only if the change is also committed to the SQL database.
 
-In this library we have standardized on using ULIDs to identity rows
-in the database.```
+The mssql-library builds on the Outbox pattern to provide an in-database
+change feed. This allows the same Outbox to be used several times for different
+purposes; or for e.g. both re-constitution and live event export using
+the same building block.
+
+
 
 ### Problem statement
 The simple view is that polling for INSERTs in a table can be done
@@ -173,3 +177,7 @@ track the number of ULIDs generated across several statements.
 ## Still curious?
 
 Head over to the [experts guide](EXPERTS-GUIDE.md).
+
+## Versions
+Note: Version 1 used a rather different approach. It is
+still available on the [v1 branch](TODO).
