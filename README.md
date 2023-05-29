@@ -1,6 +1,6 @@
 # mssql-changefeed: Changefeed SQL library for SQL Server
 
-## The reusable outbox pattern
+## Reusable outbox pattern
 
 The Outbox pattern is often used to make sure that events are exported
 to an event broker if and only if the change is also committed to the SQL database.
@@ -10,169 +10,94 @@ change feed. This allows the same Outbox to be used several times for different
 purposes; or for e.g. both re-constitution and live event export using
 the same building block.
 
+In a sense, mssql-changefeed is like having a "mini-Kafka" in the form
+of SQL tables;  this can then be useful for several things such as:
+* Ordered export of events to brokers
+* APIs to allow fetching old or new events (such as [ZeroEventHub](https://github.com/vippsas/zeroeventhub)).
+* In-database event processing / computation / data flow patterns
 
+Why not simply use a `Time` column, or an integer `RowId int identity`
+column for these purposes? Because race conditions will make it unsafe
+to consume newer events. See [MOTIVATION.md](MOTIVATION.md) for further description
+of the basic problem this library solves.
 
-### Problem statement
-The simple view is that polling for INSERTs in a table can be done
-simply by querying for new data since last time. For instance,
-if `MyTable` has an `EventID identity` column, you can do: 
-```
-select * from MyTable
-where EventID > @LastEventIDFromPreviousPolling  
-```
+### About ULIDs
 
-The problem is that this solution is not race-safe
-on its own. The problem is illustrated in the following
-figure.
+mssql-changefeed makes an opinionated choice of using [ULIDs](https://github.com/ulid/spec)
+as "event sequence numbers". This allows for generating cursor values
+that embed a timestamp, and you get unique IDs for your events that are ensured
+to be in sequence. Also, the use of ULIDs makes changing the number of partitions
+a much easier affair.
 
-![Illustration of multiple concurrent inserts into a SQL table](bottom-of-table.png)
-In this image, the solid black rows have been committed and are visible
-to readers. The grayed out rows (4, 6, and 8) are in *pending* transactions,
-not yet committed, and are only visible to the transactions writing them.
+The library would have worked equally well with integer sequence numbers;
+it could be made an option in the future.
 
-If a reader now reads the table, it will see the 7th row as the last
-one and note down `ULID = 0x...B5A` as its cursor position in the table,
-*without* having read the 4th and 6th row -- thus never consuming this data.
+## Installation
 
-### How the problem is solved
-
-It is not very difficult to use database transactions to *serialize* the
-access to a particular `(feed_id, shard)` pair. This approach works rather
-well if everything you do is in a single stored procedure in the SQL server.
-
-The problem is if you use client-managed database transactions, and are
-disconnected at the wrong moment.
-
-The mssql-changefeed library provides the ability to serialize writes
-to a given shard in a *safe* manner, no matter if you use client-managed
-transactions or not. [There is separate document
-for the technical details](EXPERTS-GUIDE.md).
-
-### Installation
-
+### Migrations
 Copy the file(s) in the `migrations` directory and run them in the database.
 The standard is to create tables and stored procedures in a `changefeed`
-schema; alter the migration file as needed to serve your needs.
+schema (the migration file is written such that you can globally search and replace
+`[changefeed]` to change the schema name).
 
-If you use stored procedures or otherwise make sure your SQL transactions
-are done with a single network round-trip to the SQL server, this is all
-you need. If you want to do client-side transactions, use of these tools
-is not perfectly safe unless you also create those transactions
-using the libraries. We have support for:
+### Feed setup
 
-* Go (see `go/` sub-directory)
-* Goal for later: .NET
-
-### Usage
-
-Concepts:
-
-* `feed_id` is a UUID that you generate once manually and put into your
-  source code. This identifies a particular change feed; the SQL table
-  or set of tables that you insert into in a single, conceptual "change"
-  or "event".
-* `shard` is an integer, and represents a sub-division of each `feed_id`
-  to support higher throughput. You need to benchmark performance
-  in your case, but as a very rough guide, think 100 changes per secon
-  per shard. An example of using shard would be to set it to `customer_id % 32`
-  to make 32 shards and shard along the `customer_id` axis.
-  If you want to manage sharding in some other way, it is of course
-  possible to hard-code `shard` to be 0, and instead pass different
-  UUIDs for inserts into the same database tables. Only the combination
-  of `(feed_id, shard_id)` ever matters to mssql-changefeed.
-
-What we then want to achieve is
-
-1) Generate an ULID for every row you write to your table(s) 
-2) Ensure that the ULID are monotonically increasing for any observer,
-   within a shard. This means serializing the writes within each
-   shard.
-
-The locking mechanisms to achieve this are a bit complex, and this complexity
-is abstracted away behind a special "changefeed ULID transaction".
-For client-managed transactions, it is important that you use the client
-libraries for Go or C#.
-
-### Go
-
-Instead of `pool.BeginTx`, as usual, instead use `changefeed.BeginTransaction`.
-This will return another object with a similar protocol to `sql.Tx`.
-
-Once the transaction has been started, the ULID tools described below are
-available. It is also possible to call `tx.NewULIDs()` or `tx.NewSingleULID()`
-to generate ULIDs.
-
-### C#
-
-TODO
-
-### SQL
-
-If the **entire transaction is done in a single batch / stored procedure**,
-you can use the following methods. (They can also be used if you don't care about
-30-60 seconds downtime for your service).
-
-One starts the transaction by always calling these together:
+You set up a new feed by calling a stored procedure,
+passing in the name of a table, in one of your own
+migration files.
 ```sql
-begin transaction
-exec changefeed.begin_ulid_transaction
-    @feed_id = '80270756-deeb-11ed-91f2-4f03a365d3f8',
-    @shard_id = 0;
+exec [changefeed].setup_feed 'myservice.MyEvent';
+alter role [changefeed].[role:myservice.MyEvent] add member myservice_user;    
 ```
+Calling this stored procedure will generate tables
+and stored procedures tailored for your table; in particular
+the primary keys of the table is embedded. The following
+are generated; further details provided below.
+You should inspect them to ensure that they make sense,
+in particular that the primary key has been correctly
+detected and generated.
 
-Within the transaction, the ULID tools described below are available to
-generate ULIDs. Finally, make sure the following pair is executed
-closely together:
-```sql
-exec changefeed.commit_ulid_transaction
--- very important that NOTHING ELSE happens in-between the previous line
--- and the next line
-commit
-```
+* `[changefeed].[outbox:myservice.MyEvent]`: Outbox table, for changes
+  that have never been read
+* `[changefeed].[feed:myservice.MyEvent]`: Feed table, for older changes
+  that have been read once
+* `[changefeed].[read_feed:myservice.MyEvent]`: Stored procedure to read
+  events (new or old)
+* `[changefeed].[type:myservice.MyEvent]`: Type documenting the result of `read_feed`
+* `[changefeed].[role:myservice.MyEvent]`: Add members to this role to grant
+  permissions for the above.
 
-### ULID tools
+### Usage: Writing events
 
-Once the changefeed ULID transaction has been set up, ULIDs can be generated
-in two ways:
+To use mssql-changefeed, the main thing you have to ensure is that
+writes happen to `[changefeed].[outbox:myservice.MyEvent]` when appropriate.
+For a typical event sourcing table this would happen with every INSERT
+to your table. The insert can happen using a SQL trigger or by changing your
+backend code; the details of achieving this is left up to you.
 
-**Single ULID**: Call the `changefeed.single_ulid` stored procedure:
-```sql
-declare @ulid binary(10);
-exec changefeed.new_ulid @ulid = @ulid output;
-insert into customer_data.ShoeSizeChanged(CustomerID, ..., Shard, ULID) values (..., @Shard, @ULID);
-```
+The outbox tables has the following columns:
 
-**Multiple ULIDs**: To generate many (potentially millions) of ULIDs in a single
-database transaction, use the following incantation:
+* `shard`: Used to increase througput; so that consumers can consume/process
+  several partitions at the same time, in line with the "partitioned log"
+  model. If you don't wish to have several partitions, simply always pass 0.
+* `time_hint`: The time component that should be used in the generated ULIDs.
+  It is a *hint*, because, if you pass an older time than events
+  already processed from the outbox, it will not be honored, since
+  generated ULIDs must always increase (within a shard).
+* `order_after_time`: A number that specifies ordering of events.
+  If yor primary key is a simple `(AggregateID, Version)`, then
+  simply pass `Version`.
+* *Primary key*: The primary key column(s) of your table. This is *also included in the sort order*,
+  at the end.
 
-```sql
-insert into customer_data.ShoeSizeChanged(CustomerID, ..., Shard, ULID)
-select
-    input.CustomerID,
-    ...
-    @Shard,
-    changefeed.ulid_sequence(next value for changefeed.sequence over (order by form_input.Time))
-from form_submissions.Input as form_input
-where
-    form_input.CustomerID % 32 = @Shard;
-```
-This example also points out that you have to write to a *single*
-target shard within the database transaction. On the other hand,
-if you are doing this kind of batch processing, then the throughput
-is very high, and the chances of more than one target shard being
-needed is much less.
+If ordering of events matter to you, please make sure that
+`(time_hint, order_after_time)` reflects this ordering. This may
+include making sure that a new event on the same aggregate is using
+a later timestamp *even in the event of clock drift between nodes*.
 
-Note that the output of `changefeed.sequence` has *no* meaning by itself.
-It is also used concurrently by other parallel threads.
-It is a bit of a hack to be able to provide a neat interface where it
-reasonably easy to always do the correct thing. Ideally we would
-like `changefeed.ulid() over (order by form_input.Time)`, but SQL
-does not let us build that.
 
-**Note:** If the use of a sequence is a problem, we could introduce an alternative
-interface `changefeed.ulid_row_number(row_number() over (order by ...))`.
-The disadvantage of such an interface is that one would need to manually
-track the number of ULIDs generated across several statements.
+
+
 
 ## Still curious?
 
@@ -180,4 +105,9 @@ Head over to the [experts guide](EXPERTS-GUIDE.md).
 
 ## Versions
 Note: Version 1 used a rather different approach. It is
-still available on the [v1 branch](TODO).
+still available on the [v1 branch](TODO). Compared to v2, it:
+
+* Requires a sweeper to run in the background, instead of moving
+  between outbox and feed tables on access
+* Uses integer cursors instead of ULIDs
+

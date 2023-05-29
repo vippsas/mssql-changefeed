@@ -3,12 +3,10 @@ package changefeed
 import (
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"github.com/oklog/ulid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
 	"testing"
 	"time"
 
@@ -29,32 +27,6 @@ func TestDatabaseSetup(t *testing.T) {
 	assert.Equal(t, len("54b10c7d4ea54e538dd1c04bbe75d61c"), len(dbname))
 }
 
-func TestInsertShard(t *testing.T) {
-	insertShard := func(objectID int, shardID int) {
-		_, err := fixture.DB.Exec(`[changefeed].insert_shard`,
-			sql.Named("object_id", objectID),
-			sql.Named("shard_id", shardID),
-		)
-		require.NoError(t, err)
-	}
-	insertShard(0, 0)
-	insertShard(0, 1)
-	insertShard(1, 0)
-
-	// Do the same ones again (check idempotency without error)
-	insertShard(0, 0)
-	insertShard(0, 1)
-	insertShard(1, 0)
-
-	assert.Equal(t,
-		sqltest.Rows{
-			{0, 0},
-			{0, 1},
-			{1, 0},
-		},
-		sqltest.Query(fixture.DB, `select object_id, shard_id from [changefeed].shard_state_ulid order by object_id, shard_id`))
-}
-
 func TestIntegerConversionMssqlAndGo(t *testing.T) {
 	// Just an experiment, not something that will/should regress
 	ctx := context.Background()
@@ -66,22 +38,8 @@ func TestIntegerConversionMssqlAndGo(t *testing.T) {
 	assert.Equal(t, "ffffffffffffffff", fmt.Sprintf("%x", uint64(minusOne)))
 }
 
-func ulidToInt(u ulid.ULID) uint64 {
-	return binary.BigEndian.Uint64(u[8:16])
-}
-
 func TestHappyDay(t *testing.T) {
 	ctx := context.Background()
-	_, err := fixture.DB.ExecContext(ctx, `
-create table dbo.MyEvent (
-    MyAggregateID bigint not null,
-    Version int not null,
-    Datapoint1 int not null,
-    Datapoint2 varchar(max) not null,
-    ULID binary(16) not null
-);
-`)
-	require.NoError(t, err)
 
 	timeHint := time.Now()
 

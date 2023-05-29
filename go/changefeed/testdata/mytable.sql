@@ -4,8 +4,12 @@ create schema myservice;
 go
 
 create table myservice.MyTable (
-    id bigint not null primary key,
-    value varchar(max)
+    MyAggregateID bigint not null,
+    Version int not null,
+    Datapoint1 int not null,
+    Datapoint2 varchar(max) not null,
+    ULID binary(16) not null,
+    primary key (MyAggregateID, Version)
 );
 
 create table myservice.MultiPK (

@@ -1,11 +1,4 @@
 
-drop procedure if exists [changefeed].read_feed;
-drop table if exists [changefeed].shard_state;
-go
-drop schema if exists [changefeed];
-go
-
-
 create schema [changefeed];
 go
 
@@ -158,6 +151,23 @@ end
 
 go
 
+create function [changefeed].sql_create_read_type(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max)
+as begin
+    declare @table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('type:read:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
+    return concat('create type ', @table, ' as table (
+    ulid binary(16) not null,
+', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), '
+)');
+end
+
+go
+
 create function [changefeed].sql_create_read_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
@@ -236,16 +246,16 @@ as begin
         -- @lockresult = 0; got lock without waiting. Consume outbox.
 
         declare @takenFromOutbox as table (
-        time_hint datetime2(3) not null,
-        order_after_time bigint not null,
-', [changefeed].sql_primary_key_column_declarations(@object_id, '        '), '
-);
+            time_hint datetime2(3) not null,
+            order_after_time bigint not null,
+', [changefeed].sql_primary_key_column_declarations(@object_id, '            '), '
+        );
 
-                          delete top(@pagesize) from outbox
-                          output
-', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), ', deleted.time_hint, deleted.order_after_time
-                             into @takenFromOutbox
-                          from ', @outbox_table, ' as outbox
+        delete top(@pagesize) from outbox
+        output
+            deleted.time_hint, deleted.order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), '
+        into @takenFromOutbox
+            from ', @outbox_table, ' as outbox
         where outbox.Shard = @shard;
 
         if @@rowcount = 0
@@ -369,7 +379,20 @@ as begin
 
     exec sp_executesql @sql;
 
-    -- create [read:<tablename>]
+    -- create [outbox:read:<tablename>]
+    set @sql = [changefeed].sql_create_outbox_table(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+
+    -- create [type:read:<tablename>]
+    set @sql = [changefeed].sql_create_read_type(
+            @object_id,
+            @changefeed_schema);
+
+    exec sp_executesql @sql;
+
+    -- create [read_feed:<tablename>]
     set @sql = [changefeed].sql_create_read_procedure(
         @object_id,
         @changefeed_schema);
