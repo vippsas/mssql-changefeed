@@ -132,6 +132,7 @@ go
 
 create function [changefeed].sql_create_outbox_table(
     @object_id int,
+    @shard_key_type nvarchar(max),
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
 as begin
@@ -142,10 +143,11 @@ as begin
     declare @pkname nvarchar(max) = quotename(concat('pk:outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
     return concat('create table ', @table, '(
     shard int not null,
+    shard_key ', @shard_key_type, ' not null,
+    ordering bigint not null,
     time_hint datetime2(3) not null,
-    order_after_time bigint not null,
 ', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
-    constraint ', @pkname, ' primary key (shard, time_hint, order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, ''), ')
+    constraint ', @pkname, ' primary key (shard, time_hint, shard_key, ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, ''), ')
 ) with (data_compression = page)');
 end
 
@@ -170,6 +172,7 @@ go
 
 create function [changefeed].sql_create_read_procedure(
     @object_id int,
+    @shard_key_type nvarchar(max),
     @changefeed_schema nvarchar(max)
 )
 returns nvarchar(max) as begin
@@ -247,13 +250,17 @@ as begin
 
         declare @takenFromOutbox as table (
             time_hint datetime2(3) not null,
-            order_after_time bigint not null,
+            shard_key ', @shard_key_type, ' not null,
+            ordering bigint not null,
 ', [changefeed].sql_primary_key_column_declarations(@object_id, '            '), '
+
+            -- benchmarks with 1000 rows indicate that things are not faster with primary key
+            -- for some queries; but this can be re-visited more properly in the future
         );
 
         delete top(@pagesize) from outbox
         output
-            deleted.time_hint, deleted.order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), '
+            deleted.time_hint, deleted.shard_key, deleted.ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), '
         into @takenFromOutbox
             from ', @outbox_table, ' as outbox
         where outbox.Shard = @shard;
@@ -265,11 +272,33 @@ as begin
             return
         end
 
-        declare @min_time datetime2(3);
+        -- We want to support cases where time_hint is actually in a different order from event ordering
+        -- caused by (shard_key, ordering); e.g., ordering=2 has lower timestamp than ordering=1 for the
+        -- same shard_key. We can do this *locally* in the @takenFromOutbox chunk; *no* events will
+        -- get a lower timestamp than the one in shard_state, before us -- and when we are done, @max_time
+        -- will be written to shard_state. So: We simply change time_hint in a pre-processing step.
+        -- Note: While this is an O(n^2) operation in principle, it seems fast enough; around 15-30 ms for
+        -- 1000 rows in Azure SQL, and 0 to 15 ms for 100 rows.
+
+        update t1
+        set time_hint = x.max_time_hint
+        from @takenFromOutbox t1
+        cross apply (
+            select max(time_hint) as max_time_hint from @takenFromOutbox t2
+            where
+                t1.shard_key = t2.shard_key  -- only search within same shard_key...
+                and t2.ordering <= t1.ordering  -- search *everything* that has a smaller ordering; = is important to avoid null
+
+                -- Note: At this point we *could* add short-circuit `and t2.time_hint > t1.time_hint`,
+                -- but benchmarks says this is actually slower due to higher query complexity.
+        ) x;
+
+        -- From here on we know that time_hint is ordered the same as `ordering`, within each shard_key.
+
         declare @max_time datetime2(3);
         declare @count bigint;
         declare @random_bytes binary(10) = crypt_gen_random(10);
-        select @min_time = min(time_hint), @max_time = max(time_hint), @count = count(*) from @takenFromOutbox;
+        select @max_time = max(time_hint), @count = count(*) from @takenFromOutbox;
 
         -- To assign ULIDs to the events in @takenFromOutbox, we split into two cases:
         -- 1) The ones where time is <= shard_state.time. For this, the Time is adjusted up to the shard_state.time.
@@ -339,7 +368,7 @@ as begin
         output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), ')
         select
             @shard,
-            let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.time_hint, taken.order_after_time, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), ')),
+            let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.time_hint, taken.ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), ')),
             ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), '
         from @takenFromOutbox as taken
         cross apply (select
@@ -362,7 +391,8 @@ end
 go
 
 create procedure [changefeed].setup_feed(
-    @table_name nvarchar(max)
+    @table_name nvarchar(max),
+    @shard_key_type nvarchar(max) = N'bigint'
 )
 as begin
     declare @object_id int = object_id(@table_name, 'U');
@@ -382,6 +412,7 @@ as begin
     -- create [outbox:read:<tablename>]
     set @sql = [changefeed].sql_create_outbox_table(
             @object_id,
+        @shard_key_type,
             @changefeed_schema);
     exec sp_executesql @sql;
 
@@ -395,6 +426,7 @@ as begin
     -- create [read_feed:<tablename>]
     set @sql = [changefeed].sql_create_read_procedure(
         @object_id,
+        @shard_key_type,
         @changefeed_schema);
 
     exec sp_executesql @sql;
