@@ -46,7 +46,7 @@ You set up a new feed by calling a stored procedure,
 passing in the name of a table, in one of your own
 migration files.
 ```sql
-exec [changefeed].setup_feed 'myservice.MyEvent';
+exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier';
 alter role [changefeed].[role:myservice.MyEvent] add member myservice_user;    
 ```
 Calling this stored procedure will generate tables
@@ -67,7 +67,7 @@ detected and generated.
 * `[changefeed].[role:myservice.MyEvent]`: Add members to this role to grant
   permissions for the above.
 
-### Usage: Writing events
+### Writing events and the outbox table
 
 To use mssql-changefeed, the main thing you have to ensure is that
 writes happen to `[changefeed].[outbox:myservice.MyEvent]` when appropriate.
@@ -77,24 +77,27 @@ backend code; the details of achieving this is left up to you.
 
 The outbox tables has the following columns:
 
-* `shard`: Used to increase througput; so that consumers can consume/process
+* `shard_id`: Used to increase throughput; so that consumers can consume/process
   several partitions at the same time, in line with the "partitioned log"
   model. If you don't wish to have several partitions, simply always pass 0.
+  If you wish to have several partitions, you want to do something like
+  `aggregate_id % shard_count`; the sharding mechanism is left entirely to you.
 * `time_hint`: The time component that should be used in the generated ULIDs.
-  It is a *hint*, because, if you pass an older time than events
-  already processed from the outbox, it will not be honored, since
-  generated ULIDs must always increase (within a shard).
-* `order_after_time`: A number that specifies ordering of events.
-  If yor primary key is a simple `(AggregateID, Version)`, then
-  simply pass `Version`.
-* *Primary key*: The primary key column(s) of your table. This is *also included in the sort order*,
-  at the end.
-
-If ordering of events matter to you, please make sure that
-`(time_hint, order_after_time)` reflects this ordering. This may
-include making sure that a new event on the same aggregate is using
-a later timestamp *even in the event of clock drift between nodes*.
-
+  It is a *hint*, as it will not always be honored; making ULIDs monotonically
+  increase within each shard takes precedence. Pass the current time
+  for this.
+* `shard_key` and `ordering`: Used to explicitly demand an ordering of
+  events on the feed that will never be violated, even if `time_hint`
+  is giving a different order. The `shard_key` is meant to identify
+  your "entity"/"aggregate" and has a configurable type (defaults
+  to `bigint`); specifically, every event with the same `shard_key`
+  should be on the same shard. Then `ordering` (always `bigint`) specifies
+  an ordering *within* each `shard_key`. If these concepts do not make
+  sense in your application; for instance, simply always pass `0` for both
+* values.
+* *Primary keys*: The primary key column(s) of your table. These are simply
+  copied over to the feed table, and returned in the result. Essentially
+  these are the payload of the outbox/feed mechanism.
 
 
 

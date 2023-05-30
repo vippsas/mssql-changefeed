@@ -121,10 +121,10 @@ as begin
         quotename(concat('feed:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
     declare @pkname nvarchar(max) = quotename(concat('pk:feed:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
     return concat('create table ', @table, '(
-    shard int not null,
+    shard_id int not null,
     ulid binary(16) not null,
 ', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
-    constraint ', @pkname, ' primary key (shard, ulid)
+    constraint ', @pkname, ' primary key (shard_id, ulid)
 ) with (data_compression = page)');
 end
 
@@ -142,12 +142,12 @@ as begin
             quotename(concat('outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
     declare @pkname nvarchar(max) = quotename(concat('pk:outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
     return concat('create table ', @table, '(
-    shard int not null,
+    shard_id int not null,
     shard_key ', @shard_key_type, ' not null,
     ordering bigint not null,
     time_hint datetime2(3) not null,
 ', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
-    constraint ', @pkname, ' primary key (shard, time_hint, shard_key, ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, ''), ')
+    constraint ', @pkname, ' primary key (shard_id, time_hint, shard_key, ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, ''), ')
 ) with (data_compression = page)');
 end
 
@@ -200,7 +200,7 @@ returns nvarchar(max) as begin
 
     return concat('
 create procedure ', @read_feed_proc, '(
-    @shard int,
+    @shard_id int,
     @cursor binary(16),
     @pagesize int = 1000
 )
@@ -217,7 +217,7 @@ as begin
             ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), '
         from ', @feed_table, '
         where
-            shard = @shard
+            shard_id = @shard_id
             and ulid > @cursor;
 
         if @@rowcount <> 0
@@ -230,14 +230,14 @@ as begin
         begin transaction
 
         declare @lockresult int;
-        declare @lockname varchar(max) = concat(''changefeed/', @object_id, '/'', @shard)
+        declare @lockname varchar(max) = concat(''changefeed/', @object_id, '/'', @shard_id)
         exec @lockresult = sp_getapplock @Resource = @lockname, @LockMode = ''Exclusive'', @LockOwner = ''Transaction'';
         if @lockresult = 1
         begin
             rollback
             -- 1 means "got lock after timeout". This means someone else fetched from the Outbox;
             -- so, we try again to read from the end of the log.
-            exec ', @read_feed_proc, ' @shard = @shard, @cursor = @cursor, @pagesize = @pagesize;
+            exec ', @read_feed_proc, ' @shard_id = @shard_id, @cursor = @cursor, @pagesize = @pagesize;
             return
         end
 
@@ -263,7 +263,7 @@ as begin
             deleted.time_hint, deleted.shard_key, deleted.ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'deleted.'), '
         into @takenFromOutbox
             from ', @outbox_table, ' as outbox
-        where outbox.Shard = @shard;
+        where outbox.shard_id = @shard_id;
 
         if @@rowcount = 0
         begin
@@ -350,7 +350,7 @@ as begin
               end)
         ) let2
         where
-            shard_id = @shard;
+            shard_id = @shard_id;
 
         if @@rowcount = 0
         begin
@@ -361,13 +361,13 @@ as begin
             set @ulid_low_next_time = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff;
 
             insert into ', @changefeed_schema, '.shard_state (shard_id, time, ulid_high, ulid_low)
-            values (@shard, @max_time, @ulid_high_next_time, @ulid_low_next_time);
+            values (@shard_id, @max_time, @ulid_high_next_time, @ulid_low_next_time);
         end
 
-        insert into ', @feed_table, '(shard, ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, '') , ')
+        insert into ', @feed_table, '(shard_id, ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, '') , ')
         output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), ')
         select
-            @shard,
+            @shard_id,
             let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.time_hint, taken.ordering, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), ')),
             ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), '
         from @takenFromOutbox as taken
@@ -402,8 +402,11 @@ as begin
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
     declare @changefeed_schema nvarchar(max) = substring(@quoted_changefeed_schema, 2, len(@quoted_changefeed_schema) - 2);
 
+    declare @sql nvarchar(max);
+
+
     -- create [feed:<tablename>]
-    declare @sql nvarchar(max) = [changefeed].sql_create_feed_table(
+    set @sql = [changefeed].sql_create_feed_table(
             @object_id,
             @changefeed_schema);
 

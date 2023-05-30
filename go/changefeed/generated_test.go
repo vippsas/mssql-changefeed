@@ -36,7 +36,7 @@ func TestCreateReadType(t *testing.T) {
 }
 
 // This testcase is run manually to inspect the generated read: stored procedure
-func TestCreateReadProcedre(t *testing.T) {
+func TestCreateReadProcedure(t *testing.T) {
 	fixture.Reset(t)
 	var sql string
 	require.NoError(t, fixture.DB.QueryRow(`select [changefeed].sql_create_read_procedure(object_id('myservice.MultiPK'), 'uniqueidentifier', 'changefeed')`).Scan(&sql))
@@ -62,7 +62,7 @@ declare @y uniqueidentifier = newid();
 insert into myservice.MultiPK (x, y, z, v)
 values (1, @y, 'hello', 'world');
 
-insert into [changefeed].[outbox:myservice.MultiPK] (shard, time_hint, shard_key, ordering, x, y, z)
+insert into [changefeed].[outbox:myservice.MultiPK] (shard_id, time_hint, shard_key, ordering, x, y, z)
 values (0, sysutcdatetime(), 1000, 2000,   1, @y, 'hello');
 
 declare @tmp as [changefeed].[type:read:myservice.MultiPK];
