@@ -3,10 +3,12 @@ package changefeed
 import (
 	"context"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"github.com/oklog/ulid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
 	"testing"
 	"time"
 
@@ -39,108 +41,92 @@ func TestIntegerConversionMssqlAndGo(t *testing.T) {
 }
 
 func TestHappyDay(t *testing.T) {
-	ctx := context.Background()
+	_, err := fixture.DB.ExecContext(context.Background(),
+		`exec [changefeed].setup_feed 'myservice.TestHappyDay'`)
+	require.NoError(t, err)
 
-	timeHint := time.Now()
+	_, err = fixture.DB.ExecContext(context.Background(), `
+insert into myservice.TestHappyDay (AggregateID, Version, Data) values 
+	(1000, 1, '1000-1'),
+	(1000, 2, '1000-2'),
+	(1000, 3, '1000-3'),
+	(1001, 1, '1001-1'),
+	(1001, 2, '1001-2');
 
-	for k := 0; k != 2; k++ {
+-- Note: We insert in the "right" order for aggregate versions, but the time_hint is
+-- going in the wrong direction for the first cases
+insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, AggregateID, Version) values (0, '2023-05-31 12:00:00', 1000, 1);
+insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, AggregateID, Version) values (0, '2023-05-31 12:03:00', 1001, 1);
+insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, AggregateID, Version) values (0, '2023-05-31 12:02:00', 1000, 2);
+insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, AggregateID, Version) values (0, '2023-05-31 12:01:00', 1001, 2);
+insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, AggregateID, Version) values (0, '2023-05-31 12:10:00', 1000, 3);
+`)
+	require.NoError(t, err)
 
-		tx, err := fixture.DB.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSnapshot})
+	// First consume head of feed while checking that paging works
+	page1 := sqltest.Query(fixture.DB, `
+	create table #read (
+		ulid binary(16) not null,
+		AggregateID bigint not null,
+		Version int not null	    
+	);
+	exec [changefeed].[read_feed:myservice.TestHappyDay] 0, 0x0, @pagesize = 3;
+	select * from #read order by ulid;
+`)
+	// check prefix of ULID has right timestamp
+	hexUlidToTime := func(s string) string {
+		buf, err := hex.DecodeString(s[2:])
 		require.NoError(t, err)
-
-		_, err = tx.ExecContext(context.Background(), `[changefeed].init_ulid`,
-			sql.Named("table", "dbo.MyEvent"),
-			sql.Named("shard_id", 0),
-			sql.Named("timeout", -1),
-			sql.Named("time_hint", timeHint),
-		)
-		require.NoError(t, err)
-
-		for i := 0; i != 3; i++ {
-			var eventULID ulid.ULID
-			err := tx.QueryRowContext(ctx, `select [changefeed].get_ulid(@p1)`, i).Scan(&eventULID)
-			require.NoError(t, err)
-			fmt.Printf("%s = 0x%x\n", eventULID, [16]byte(eventULID))
-			_, err = tx.ExecContext(ctx, `
-insert into dbo.MyEvent(MyAggregateID, Version, Datapoint1, Datapoint2, ULID)
-values (@i, @k, 42 * @i, 'hello', @ULID)
-`,
-				sql.Named("i", i),
-				sql.Named("k", k),
-				sql.Named("ULID", eventULID),
-			)
-			require.NoError(t, err)
-		}
-		require.NoError(t, tx.Commit())
+		var u ulid.ULID
+		copy(u[:], buf)
+		return time.Unix(int64(u.Time())/1000, 0).UTC().Format(time.RFC3339)
 	}
-}
 
-/*
-func TestTransactionWrappers(t *testing.T) {
-	ctx := context.Background()
-	timeHint, err := time.Parse(time.RFC3339, "2023-01-02T15:04:05Z")
+	assert.Equal(t, 3, len(page1))
+	// check that time_hint didn't get honored but time component of ULID shifted to maintain the order
+	assert.Equal(t, "2023-05-31T12:00:00Z", hexUlidToTime(page1[0][0].(string)))
+	assert.Equal(t, "2023-05-31T12:03:00Z", hexUlidToTime(page1[1][0].(string)))
+	assert.Equal(t, "2023-05-31T12:03:00Z", hexUlidToTime(page1[2][0].(string)))
 
-	feedID := uuid.Must(uuid.FromString("3783faf0-e336-11ed-873f-7fc575a39d77"))
-	shardID := 242
+	page2 := sqltest.Query(fixture.DB, `
+	create table #read (
+		ulid binary(16) not null,
+		AggregateID bigint not null,
+		Version int not null	    
+	);
+	declare @cursorbin binary(16) = convert(binary(16), @cursor)
+	exec [changefeed].[read_feed:myservice.TestHappyDay] 0, @cursorbin, @pagesize = 100;
+	select * from #read order by ulid;
+`, sql.Named("cursor", page1[1][0]))
 
-	tx, err := BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
-	require.NoError(t, err)
-	// This is the transaction where we inserted the shard_ulid; it should be zero-initiatialized
-	assert.Equal(t, 0, sqltest.QueryInt(tx, `select ulid_low from changefeed.shard_ulid where feed_id = @p1`, feedID))
+	assert.Equal(t, 5, len(page1)+len(page2))
+	// the :03 is carried over through shard_state, replacing time_hint that was :00
+	assert.Equal(t, "2023-05-31T12:03:00Z", hexUlidToTime(page2[0][0].(string)))
+	assert.Equal(t, "2023-05-31T12:10:00Z", hexUlidToTime(page2[1][0].(string)))
 
-	gotTime, err := tx.Time(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, timeHint, gotTime)
+	// Check that table sizes are what we expect
+	assert.Equal(t, 0, sqltest.QueryInt(fixture.DB, `select count(*) from [changefeed].[outbox:myservice.TestHappyDay]`))
+	assert.Equal(t, 5, sqltest.QueryInt(fixture.DB, `select count(*) from [changefeed].[feed:myservice.TestHappyDay]`))
 
-	ulid1, err := tx.NextULID(ctx)
-	require.NoError(t, err)
-	ulid2, err := tx.NextULID(ctx)
-	require.NoError(t, err)
-	ulid3, err := tx.NextULID(ctx)
-	require.NoError(t, err)
-	assert.True(t, ulidToInt(ulid1)+1 == ulidToInt(ulid2))
-	assert.True(t, ulidToInt(ulid2)+1 == ulidToInt(ulid3))
+	// Do a re-read of feed from start, skipping the ULIDs to get predictable data for assertion
+	allEvents := sqltest.Query(fixture.DB, `
+	create table #read (
+		ulid binary(16) not null,
+		AggregateID bigint not null,
+		Version int not null	    
+	);
+	declare @cursorbin binary(16) = convert(binary(16), @cursor)
+	exec [changefeed].[read_feed:myservice.TestHappyDay] 0, 0x0, 100;
+	select AggregateID, Version from #read order by ulid;
+`, sql.Named("cursor", page1[1][0]))
 
-	err = tx.Commit()
-	require.NoError(t, err)
-
-	// Check state committed to DB
-	var gotUlidHigh []byte
-	var gotUlidLow int64
-	require.NoError(t, fixture.DB.QueryRowContext(context.Background(),
-		`select ulid_high, ulid_low, time from changefeed.shard_ulid where feed_id = @p1 and shard_id = @p2`,
-		feedID, shardID).Scan(&gotUlidHigh, &gotUlidLow, &gotTime))
-	assert.True(t, ulidToInt(ulid3)+1 == uint64(gotUlidLow))
-	assert.Equal(t, gotUlidHigh[:], ulid3[0:8])
-	assert.Equal(t, timeHint, gotTime)
-
-	// Continue next transaction from *same* timestamp -- should continue counting on the same range
-	tx, err = BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
-	require.NoError(t, err)
-	ulid4a, err := tx.NextULID(ctx)
-	require.NoError(t, err)
-
-	// the +2 instead of +1 is because of extra sampling of the sequence ... keeping it instead of
-	// correcting as having a bit more space for good measure doesn't hurt
-	assert.True(t, ulidToInt(ulid3)+2 == ulidToInt(ulid4a))
-	// roll back!
-	err = tx.Rollback()
-	require.NoError(t, err)
-
-	// Continue again, since we rolled back previously we should continue on the same range
-	tx, err = BeginTransaction(fixture.DB, context.Background(), feedID, shardID, &TransactionOptions{TimeHint: timeHint})
-	require.NoError(t, err)
-	ulid4b, err := tx.NextULID(ctx)
-	require.NoError(t, err)
-	// +2: see above
-	assert.True(t, ulidToInt(ulid3)+2 == ulidToInt(ulid4b))
-	// roll back!
-	err = tx.Rollback()
-	require.NoError(t, err)
+	// this assertion is less trivial than it looks like, since the time_hint is ordered *in reverse*,
+	assert.Equal(t, sqltest.Rows{
+		{1000, 1},
+		{1001, 1},
+		{1000, 2},
+		{1001, 2},
+		{1000, 3},
+	}, allEvents)
 
 }
-
-func TestCommitVsRollback(t *testing.T) {
-	// TODO
-}
-*/

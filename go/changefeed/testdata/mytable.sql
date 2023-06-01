@@ -3,6 +3,13 @@ create schema myservice;
 
 go
 
+create table myservice.TestHappyDay (
+    AggregateID bigint not null,
+    Version int not null,
+    Data varchar(max) not null,
+    primary key (AggregateID, Version)
+);
+
 create table myservice.MyTable (
     MyAggregateID bigint not null,
     Version int not null,
@@ -19,3 +26,4 @@ create table myservice.MultiPK (
     v varchar(max) not null,
     primary key (x, y, z)
 )
+

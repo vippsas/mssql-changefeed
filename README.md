@@ -86,12 +86,12 @@ The outbox tables has the following columns:
   It is a *hint*, as it will not always be honored; making ULIDs monotonically
   increase within each shard takes precedence. Pass the current time
   for this.
-* `shard_key` and `ordering`: Used to explicitly demand an ordering of
+* `shard_key` and `order_number`: Used to explicitly demand an ordering of
   events on the feed that will never be violated, even if `time_hint`
   is giving a different order. The `shard_key` is meant to identify
   your "entity"/"aggregate" and has a configurable type (defaults
   to `bigint`); specifically, every event with the same `shard_key`
-  should be on the same shard. Then `ordering` (always `bigint`) specifies
+  should be on the same shard. Then `order_number` (always `bigint`) specifies
   an ordering *within* each `shard_key`. If these concepts do not make
   sense in your application; for instance, simply always pass `0` for both
 * values.

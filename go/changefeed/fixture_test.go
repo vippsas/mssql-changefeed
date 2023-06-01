@@ -7,7 +7,6 @@ import (
 	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/gofrs/uuid"
-	"github.com/stretchr/testify/require"
 	"io/ioutil"
 	"os"
 	"strings"
@@ -62,15 +61,6 @@ func (f *Fixture) RunMigrations() {
 			lineno += strings.Count(p, "\n") + 2
 		}
 	}
-}
-
-func (f *Fixture) Reset(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	require.NoError(t, discardResult(fixture.DB.ExecContext(ctx, `
-delete from changefeed.shard_state;
-`)))
-
 }
 
 var MyTableObjectID int
