@@ -26,8 +26,6 @@ as begin
         quotename(concat('outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id))))
 end
 
--- https://stackoverflow.com/questions/10977483/extended-type-name-function-that-includes-datalength
-
 go
 
 create function [changefeed].sql_fully_quoted_name(@object_id int)
@@ -191,6 +189,170 @@ end
 
 go
 
+create function [changefeed].sql_create_feed_write_lock_procedure(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max) as begin
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @lock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('feed_write_lock:', @unquoted_qualified_table_name)))
+
+    return concat('
+-- feed_write_lock:* takes a lock, owned by the Transaction, indicating that
+-- the feed will be written to. One should *also* do update_shard_state which
+-- takes its own lock implicitly, but read_feed:* needs to also have a pre-lock
+-- before updating the shard state (in order to know what timestamps are in the outbox)
+create procedure ', @lock_proc, '(
+    @shard_id int,
+    @lock_timeout int = -1,  -- same as sp_getallock
+    @lock_result int output
+) as begin
+    declare @lockname varchar(max) = concat(''changefeed/', @object_id, '/'', @shard_id)
+    exec @lock_result = sp_getapplock
+        @Resource = @lockname,
+        @LockMode = ''Exclusive'',
+        @LockOwner = ''Transaction'',
+        @LockTimeout = @lock_timeout;
+end;
+')
+end;
+
+go
+
+create function [changefeed].sql_create_lock_procedure(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max) as begin
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @state_table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('state:', @unquoted_qualified_table_name)))
+
+    declare @lock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('lock:', @unquoted_qualified_table_name)))
+
+    return concat('
+create procedure ', @lock_proc, '(
+    -- Default is to allocate a very large @count; the next lock within the same millisecond will start
+    -- after this number added to the one we allocate first. We assume 2^40 ULIDs generated in each
+    -- transaction (including waste due to concurrent use of changefeed.sequence), leaving room for
+    -- 2^23 transactions to execute on the same shard in the same millisecond...
+    @count bigint = 1099511627776,
+
+) as begin
+
+
+end;
+')
+end;
+
+go
+
+create function [changefeed].sql_create_update_state_procedure(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max) as begin
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @state_table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('state:', @unquoted_qualified_table_name)))
+
+    declare @update_state_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('update_state:', @unquoted_qualified_table_name)))
+
+    return concat('
+create procedure ', @update_state_proc, '(
+    @shard_id int,
+    @time_hint datetime2(3),
+    @count bigint,
+
+    @previous_time datetime2(3) = null output,
+    @previous_ulid_high binary(8) = null output,
+    @previous_ulid_low bigint = null output,
+
+    @next_time datetime2(3) = null output,
+    @next_ulid_high binary(8) = null output,
+    @next_ulid_low bigint = null output
+)
+as begin
+    set xact_abort, nocount on;
+    begin try
+        if @@trancount = 0 throw 77100, ''Please call this procedure inside a transaction'', 0;
+
+        declare @random_bytes binary(10) = crypt_gen_random(10);
+
+        update shard_state
+        set
+            @previous_time = shard_state.time,
+            @next_time = shard_state.time = let1.new_time,
+            @previous_ulid_high = shard_state.ulid_high,
+            @previous_ulid_low = shard_state.ulid_low,
+            @next_ulid_high = shard_state.ulid_high = let2.new_ulid_high,
+            @next_ulid_low = let2.ulid_low_range_start,
+            -- add @count to the value stored in ulid_low; the ulid_low stored is the *first* value to be used
+            -- by the next iteration
+            shard_state.ulid_low = let2.ulid_low_range_start + @count
+        from ', @state_table, ' shard_state with (updlock, serializable, rowlock)
+        cross apply (select
+            new_time = iif(@time_hint > shard_state.time, @time_hint, shard_state.time)
+        ) let1
+        cross apply (select
+            new_ulid_high = (case
+                when @time_hint > shard_state.time then
+                    -- New timestamp, so generate new ulid_high (the timestamp + 2 random bytes).
+                    convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', new_time)) + substring(@random_bytes, 1, 2)
+                else
+                    shard_state.ulid_high
+                end)
+          , ulid_low_range_start = (case
+              when @time_hint > shard_state.time then
+                  -- Start ulid_low in new, random place.
+                  -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
+                  -- as the caller adds numbers to this
+                  convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
+              else
+                  shard_state.ulid_low
+              end)
+        ) let2
+        where
+            shard_id = @shard_id;
+
+        if @@rowcount = 0
+        begin
+            -- First time we read from this shard; upsert behaviour.
+            --
+            -- Leave @previous_X to null since there wasn''t anything previously
+            set @next_time = @time_hint;
+            set @next_ulid_high = convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', @time_hint)) + substring(@random_bytes, 1, 2);
+            set @next_ulid_low = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff;;
+
+            insert into ', @state_table, ' (shard_id, time, ulid_high, ulid_low)
+            values (@shard_id, @next_time, @next_ulid_high, @next_ulid_low);
+        end
+
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        throw;
+    end catch
+end
+');
+
+end
+
+go
+
 create function [changefeed].sql_create_read_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
@@ -223,6 +385,21 @@ returns nvarchar(max) as begin
             '.',
             quotename(concat('read_feed:', @unquoted_qualified_table_name)))
 
+    declare @rawlock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('rawlock:', @unquoted_qualified_table_name)))
+
+    declare @feed_write_lock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('feed_write_lock:', @unquoted_qualified_table_name)))
+
+    declare @update_state_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('update_state:', @unquoted_qualified_table_name)))
+
     return concat('
 create procedure ', @read_feed_proc, '(
     @shard_id int,
@@ -254,10 +431,18 @@ as begin
         -- we put it into the log, so enter transaction.
         begin transaction
 
-        declare @lockresult int;
-        declare @lockname varchar(max) = concat(''changefeed/', @object_id, '/'', @shard_id)
-        exec @lockresult = sp_getapplock @Resource = @lockname, @LockMode = ''Exclusive'', @LockOwner = ''Transaction'';
-        if @lockresult = 1
+        -- Use an application lock to make sure only one session will
+        -- process the outbox at the time. However, the shard state itself
+        -- is really protected by the `update` statement in rawlock:, not
+        -- this lock. I.e. this lock *only* protects consumption of the outbox
+        -- and that those using read_feed sees a consistent picture.
+
+        declare @lock_result int;
+        exec ', @feed_write_lock_proc, '
+            @shard_id = @shard_id,
+            @lock_timeout = -1,
+            @lock_result = @lock_result output;
+        if @lock_result = 1
         begin
             rollback
             -- 1 means "got lock after timeout". This means someone else fetched from the Outbox;
@@ -266,12 +451,12 @@ as begin
             return
         end;
 
-        if @lockresult < 0
+        if @lock_result < 0
         begin
             throw 77100, ''Error getting lock'', 1;
         end;
 
-        -- @lockresult = 0; got lock without waiting. Consume outbox.
+        -- @lock_result = 0; got lock without waiting. Consume outbox.
 
         declare @takenFromOutbox as table (
             order_sequence bigint not null primary key,
@@ -321,68 +506,31 @@ as begin
         select @max_time = max(time_hint), @count = count(*) from @takenFromOutbox;
 
         -- To assign ULIDs to the events in @takenFromOutbox, we split into two cases:
-        -- 1) The ones where time is <= shard_state.time. For this, the Time is adjusted up to the shard_state.time.
-        --    We suffix these variables _current_time.
+        -- 1) The ones where time is <= shard_state.time. For this, adjust up to the shard_state.time
         --
-        -- 2) The ones where time is > shard_state.time. We suffix these _next_time.
+        -- 2) The ones where time is > shard_state.time.
         --    For these, for efficency and simplicity, we use the *same* random component,
         --    even if the time component varies within this set.
         --
         -- In the case that @max_time <= shard_state.time, we will only have the first case hitting;
-        -- in this case we set all values equal to the same; and we also set @max_time to shard_state.time,
-        -- so in that case, @current_time = max_time.
+        -- in this case we set all values equal to the same.
+        declare @previous_time datetime2(3);
+        declare @previous_ulid_high binary(8);
+        declare @previous_ulid_low bigint;
 
-        declare @current_time datetime2(3);
-        declare @ulid_high_current_time binary(8), @ulid_high_next_time binary(8)
-        declare @ulid_low_current_time bigint, @ulid_low_next_time bigint
+        declare @next_time datetime2(3);
+        declare @next_ulid_high binary(8);
+        declare @next_ulid_low bigint;
 
-        update shard_state
-        set
-            @current_time = shard_state.time,
-            @max_time = shard_state.time = let1.new_time,
-            @ulid_high_current_time = shard_state.ulid_high,
-            @ulid_low_current_time = shard_state.ulid_low,
-            @ulid_high_next_time = shard_state.ulid_high = let2.new_ulid_high,
-            @ulid_low_next_time = let2.ulid_low_range_start,
-            -- add @count to the value stored in ulid_low; the ulid_low stored is the *first* value to be used
-            -- by the next iteration
-            shard_state.ulid_low = let2.ulid_low_range_start + @count
-        from ', @state_table, ' shard_state with (updlock, serializable, rowlock)
-        cross apply (select
-            new_time = iif(@max_time > shard_state.time, @max_time, shard_state.time)
-        ) let1
-        cross apply (select
-            new_ulid_high = (case
-                when @max_time > shard_state.time then
-                    -- New timestamp, so generate new ulid_high (the timestamp + 2 random bytes).
-                    convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', new_time)) + substring(@random_bytes, 1, 2)
-                else
-                    shard_state.ulid_high
-                end)
-          , ulid_low_range_start = (case
-              when @max_time > shard_state.time then
-                  -- Start ulid_low in new, random place.
-                  -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
-                  -- as the caller adds numbers to this
-                  convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
-              else
-                  shard_state.ulid_low
-              end)
-        ) let2
-        where
-            shard_id = @shard_id;
-
-        if @@rowcount = 0
-        begin
-            -- First time we read from this shard; upsert behaviour. @current_time is null for "minus infinity".
-            -- @max_time keeps current value. Also leave @ulid_high_current_time and @ulid_low_current_time as null,
-            -- since they will never be used.
-            set @ulid_high_next_time = convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', @max_time)) + substring(@random_bytes, 1, 2);
-            set @ulid_low_next_time = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff;
-
-            insert into ', @state_table, ' (shard_id, time, ulid_high, ulid_low)
-            values (@shard_id, @max_time, @ulid_high_next_time, @ulid_low_next_time);
-        end
+        exec ', @update_state_proc, '
+            @shard_id = @shard_id,
+            @time_hint = @max_time,
+            @count = @count,
+            @previous_time = @previous_time output,
+            @previous_ulid_high = @previous_ulid_high output,
+            @previous_ulid_low = @previous_ulid_low output,
+            @next_ulid_high = @next_ulid_high output,
+            @next_ulid_low = @next_ulid_low output;
 
         insert into ', @feed_table, '(shard_id, ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, '') , ')
         output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), ')
@@ -392,8 +540,16 @@ as begin
             ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'taken.'), '
         from @takenFromOutbox as taken
         cross apply (select
-            ulid_high = iif(@current_time is null or taken.time_hint > @current_time, convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', taken.time_hint)), @ulid_high_current_time),
-            ulid_low = iif(@current_time is null or taken.time_hint > @current_time, @ulid_low_next_time, @ulid_low_current_time)
+            ulid_high = iif(
+                -- embed max(time_hint, @previous_time) in ulid_high
+                @previous_time is null or taken.time_hint > @previous_time,
+                convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', taken.time_hint)),
+                @previous_ulid_high),
+            ulid_low = iif(
+                -- use ulid_low matching the cases above
+                @previous_time is null or taken.time_hint > @previous_time,
+                @next_ulid_low,
+                @previous_ulid_low)
         ) let;
 
         commit
@@ -447,9 +603,34 @@ as begin
             @changefeed_schema);
     exec sp_executesql @sql;
 
+    -- create [feed_write_lock:<tablename>]
+    set @sql = [changefeed].sql_create_feed_write_lock_procedure(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+
+    -- create [update_state:<tablename>]
+    set @sql = [changefeed].sql_create_update_state_procedure(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+
     -- create [read_feed:<tablename>]
     set @sql = [changefeed].sql_create_read_procedure(
         @object_id,
         @changefeed_schema);
     exec sp_executesql @sql;
 end
+
+
+go
+
+create function [changefeed].ulid(@sequence_sample bigint) returns binary(16)
+as begin
+    return convert(binary(8), session_context(N'changefeed.ulid_high'))
+        + convert(binary(8),
+                       convert(bigint, session_context(N'changefeed.ulid_low'))
+                       + (@sequence_sample - convert(bigint, session_context(N'changefeed.sequence_start')))
+               );
+end
+

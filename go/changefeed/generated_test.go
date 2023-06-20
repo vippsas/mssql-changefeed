@@ -53,6 +53,24 @@ func TestCreateReadProcedure(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestCreateFeedWriteLockProcedure(t *testing.T) {
+	var sql string
+	require.NoError(t, fixture.DB.QueryRow(`select [changefeed].sql_create_feed_write_lock_procedure(object_id('myservice.MultiPK'), 'changefeed')`).Scan(&sql))
+	fmt.Println(sql)
+	// Simply check that generated SQL compiles
+	_, err := fixture.DB.ExecContext(context.Background(), sql)
+	require.NoError(t, err)
+}
+
+func TestCreateUpdateStateProcedure(t *testing.T) {
+	var sql string
+	require.NoError(t, fixture.DB.QueryRow(`select [changefeed].sql_create_update_state_procedure(object_id('myservice.MultiPK'), 'changefeed')`).Scan(&sql))
+	fmt.Println(sql)
+	// Simply check that generated SQL compiles
+	_, err := fixture.DB.ExecContext(context.Background(), sql)
+	require.NoError(t, err)
+}
+
 func TestPermissions(t *testing.T) {
 	panic("hi")
 }
