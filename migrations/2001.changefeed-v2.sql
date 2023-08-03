@@ -46,19 +46,21 @@ create function [changefeed].sql_primary_key_columns_joined_by_comma(
     @prefix nvarchar(max)  -- for instance, 'tablealias.'; to put this in front of every column
 )
 returns nvarchar(max)
-as begin
-    return (select
-        string_agg(concat(@prefix, col.name), ', ') within group (order by col.column_id)
-    from sys.key_constraints as pk
-    join sys.index_columns as ic on
-        ic.index_id = pk.unique_index_id
-        and ic.object_id = pk.parent_object_id
-    join sys.columns as col on
-        col.object_id = pk.parent_object_id
-        and col.column_id = ic.index_column_id
-    where
-        pk.parent_object_id = @object_id
-        and pk.type = 'PK');
+as
+begin
+return (select string_agg(concat(@prefix, col.name), ', ') within group ( order by col.name)
+    from sys.tables tab
+    inner join sys.indexes pk
+    on tab.object_id = pk.object_id
+    and pk.is_primary_key = 1
+    inner join sys.index_columns ic
+    on ic.object_id = pk.object_id
+    and ic.index_id = pk.index_id
+    inner join sys.columns col
+    on pk.object_id = col.object_id
+    and col.column_id = ic.column_id
+    where pk.object_id = @object_id
+    and pk.is_primary_key = 1);
 end
 
 go
