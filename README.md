@@ -1,8 +1,6 @@
 # mssql-changefeed: Changefeed SQL library for SQL Server
 
-## Overview
-
-### Mini event broker in SQL
+## Event broker in SQL
 The mssql-changefeed library provides a "mini event broker", or pub/sub features,
 inside of your
 Microsoft SQL database; by provisioning a few SQL tables and providing
@@ -89,8 +87,9 @@ depends on your context. For most real world usecases, *both* are acceptable.
     client-side transactions.
 
 In general, choose the outbox pattern for "OLTP" workloads where you do lots
-of single-row inserts in parallel, and to serialize writers for more
-batch-oriented workloads writing larger chunks of data at the time.
+of single-row inserts in parallel. For more batch-oriented workloads
+where you write largers chunks of data at the time, you may choose
+either approach.
 
 
 ### Outbox pattern

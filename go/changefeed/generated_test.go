@@ -80,6 +80,11 @@ func TestSetupFeed(t *testing.T) {
 		`exec [changefeed].setup_feed 'myservice.MultiPK'`)
 	require.NoError(t, err)
 
+	// test that upgrade_feed doesn't produce errors, it will alter/overwrite stored procedures
+	_, err = fixture.DB.ExecContext(context.Background(),
+		`exec [changefeed].upgrade_feed 'myservice.MultiPK'`)
+	require.NoError(t, err)
+
 	// Smoketest of generated function... the real tests are in changefeed_test.go though
 	var value string
 	err = fixture.DB.QueryRowContext(context.Background(), `
@@ -101,4 +106,5 @@ join #read as r on r.x = t.x and r.y = t.y and r.z = t.z;
 `).Scan(&value)
 	require.NoError(t, err)
 	assert.Equal(t, "world", value)
+
 }

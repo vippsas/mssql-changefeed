@@ -3,7 +3,7 @@ create schema [changefeed];
 
 go
 
-create function [changefeed].sql_unquoted_qualified_table_name(@object_id int)
+create or alter function [changefeed].sql_unquoted_qualified_table_name(@object_id int)
 returns nvarchar(max)
 as begin
     return (select concat(s.name, N'.', o.name)
@@ -15,7 +15,7 @@ end;
 
 go
 
-create function [changefeed].sql_outbox_table_name(
+create or alter function [changefeed].sql_outbox_table_name(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
@@ -28,7 +28,7 @@ end
 
 go
 
-create function [changefeed].sql_fully_quoted_name(@object_id int)
+create or alter function [changefeed].sql_fully_quoted_name(@object_id int)
 returns nvarchar(max)
 as begin
     return concat(
@@ -39,29 +39,25 @@ end
 
 go
 
-create function [changefeed].sql_primary_key_columns_joined_by_comma(
+create or alter function [changefeed].sql_primary_key_columns_joined_by_comma(
     @object_id int,
     @prefix nvarchar(max)  -- for instance, 'tablealias.'; to put this in front of every column
 )
 returns nvarchar(max)
 as begin
-    return (select
-        string_agg(concat(@prefix, col.name), ', ') within group (order by col.column_id)
-    from sys.key_constraints as pk
-    join sys.index_columns as ic on
-        ic.index_id = pk.unique_index_id
-        and ic.object_id = pk.parent_object_id
-    join sys.columns as col on
-        col.object_id = pk.parent_object_id
-        and col.column_id = ic.index_column_id
-    where
-        pk.parent_object_id = @object_id
-        and pk.type = 'PK');
+    return (select string_agg(concat(@prefix, col.name), ', ') within group ( order by col.name)
+            from sys.tables tab
+            inner join sys.indexes pk on tab.object_id = pk.object_id
+            inner join sys.index_columns ic on ic.object_id = pk.object_id and ic.index_id = pk.index_id
+            inner join sys.columns col on pk.object_id = col.object_id and col.column_id = ic.column_id
+            where
+                pk.object_id = @object_id and pk.is_primary_key = 1
+            );
 end
 
 go
 
-create function [changefeed].sql_primary_key_column_declarations(@object_id int, @prefix nvarchar(max))
+create or alter function [changefeed].sql_primary_key_column_declarations(@object_id int, @prefix nvarchar(max))
 returns nvarchar(max)
 as begin
     -- returns a list of column declarations for the primary key of the given table;
@@ -88,7 +84,7 @@ end
 
 go
 
-create function [changefeed].sql_create_state_table(
+create or alter function [changefeed].sql_create_state_table(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
@@ -121,7 +117,7 @@ end
 
 go
 
-create function [changefeed].sql_create_feed_table(
+create or alter function [changefeed].sql_create_feed_table(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
@@ -141,7 +137,7 @@ end
 
 go
 
-create function [changefeed].sql_create_outbox_table(
+create or alter function [changefeed].sql_create_outbox_table(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
@@ -172,7 +168,7 @@ end
 
 go
 
-create function [changefeed].sql_create_read_type(
+create or alter function [changefeed].sql_create_read_type(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max)
@@ -189,7 +185,7 @@ end
 
 go
 
-create function [changefeed].sql_create_feed_write_lock_procedure(
+create or alter function [changefeed].sql_create_feed_write_lock_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max) as begin
@@ -205,7 +201,7 @@ create function [changefeed].sql_create_feed_write_lock_procedure(
 -- the feed will be written to. One should *also* do update_shard_state which
 -- takes its own lock implicitly, but read_feed:* needs to also have a pre-lock
 -- before updating the shard state (in order to know what timestamps are in the outbox)
-create procedure ', @lock_proc, '(
+create or alter procedure ', @lock_proc, '(
     @shard_id int,
     @lock_timeout int = -1,  -- same as sp_getallock
     @lock_result int output
@@ -222,7 +218,7 @@ end;
 
 go
 
-create function [changefeed].sql_create_lock_procedure(
+create or alter function [changefeed].sql_create_lock_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max) as begin
@@ -239,7 +235,7 @@ create function [changefeed].sql_create_lock_procedure(
             quotename(concat('lock:', @unquoted_qualified_table_name)))
 
     return concat('
-create procedure ', @lock_proc, '(
+create or alter procedure ', @lock_proc, '(
     -- Default is to allocate a very large @count; the next lock within the same millisecond will start
     -- after this number added to the one we allocate first. We assume 2^40 ULIDs generated in each
     -- transaction (including waste due to concurrent use of changefeed.sequence), leaving room for
@@ -255,7 +251,7 @@ end;
 
 go
 
-create function [changefeed].sql_create_update_state_procedure(
+create or alter function [changefeed].sql_create_update_state_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
 ) returns nvarchar(max) as begin
@@ -272,7 +268,7 @@ create function [changefeed].sql_create_update_state_procedure(
             quotename(concat('update_state:', @unquoted_qualified_table_name)))
 
     return concat('
-create procedure ', @update_state_proc, '(
+create or alter procedure ', @update_state_proc, '(
     @shard_id int,
     @time_hint datetime2(3),
     @count bigint,
@@ -353,7 +349,7 @@ end
 
 go
 
-create function [changefeed].sql_create_read_procedure(
+create or alter function [changefeed].sql_create_read_procedure(
     @object_id int,
     @changefeed_schema nvarchar(max)
 )
@@ -400,8 +396,10 @@ returns nvarchar(max) as begin
             '.',
             quotename(concat('update_state:', @unquoted_qualified_table_name)))
 
+    declare @pklist nvarchar(max) = [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N'');
+
     return concat('
-create procedure ', @read_feed_proc, '(
+create or alter procedure ', @read_feed_proc, '(
     @shard_id int,
     @cursor binary(16),
     @pagesize int = 1000
@@ -413,10 +411,10 @@ as begin
 
         delete from #read;
 
-        insert into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''),')
+        insert into #read(ulid, ', @pklist,')
         select top(@pagesize)
             ulid,
-            ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), '
+            ', @pklist, '
         from ', @feed_table, '
         where
             shard_id = @shard_id
@@ -445,9 +443,18 @@ as begin
         if @lock_result = 1
         begin
             rollback
-            -- 1 means "got lock after timeout". This means someone else fetched from the Outbox;
-            -- so, we try again to read from the end of the log.
-            exec ', @read_feed_proc, ' @shard_id = @shard_id, @cursor = @cursor, @pagesize = @pagesize;
+            -- 1 means "got lock after timeout". This means someone else has processed the outbox;
+            -- so we try again once. If there are no results here, it just means the outbox was empty
+            -- just now anyway .. the caller should sleep a bit before retrying.
+
+            insert into #read(ulid, ', @pklist,')
+            select top(@pagesize)
+                ulid,
+                ', @pklist, '
+            from ', @feed_table, '
+            where
+                shard_id = @shard_id
+                and ulid > @cursor;
             return
         end;
 
@@ -532,8 +539,8 @@ as begin
             @next_ulid_high = @next_ulid_high output,
             @next_ulid_low = @next_ulid_low output;
 
-        insert into ', @feed_table, '(shard_id, ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, '') , ')
-        output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, N''), ')
+        insert into ', @feed_table, '(shard_id, ulid, ', @pklist , ')
+        output inserted.ulid, ', [changefeed].sql_primary_key_columns_joined_by_comma(@object_id, 'inserted.'), ' into #read(ulid, ', @pklist, ')
         select
             @shard_id,
             let.ulid_high + convert(binary(8), let.ulid_low - 1 + row_number() over (order by taken.order_sequence)),
@@ -566,7 +573,44 @@ end
 
 go
 
-create procedure [changefeed].setup_feed(
+-- upgrade_feed is called if setup_feed has earlier been called to upgrade to a new version.
+-- right now this only supports to re-run all stored procedures as `create or alter`, allowing
+-- code updates in the stored procedures without affecting the tables created
+create or alter procedure [changefeed].upgrade_feed(
+    @table_name nvarchar(max)
+)
+as begin
+    declare @object_id int = object_id(@table_name, 'U');
+    if @object_id is null throw 71000, 'Could not find @table_name', 0;
+
+    -- in order to be able to search/replace [changefeed] in this script, this is bit weird:
+    declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
+    declare @changefeed_schema nvarchar(max) = substring(@quoted_changefeed_schema, 2, len(@quoted_changefeed_schema) - 2);
+
+    declare @sql nvarchar(max);
+
+    -- create [feed_write_lock:<tablename>]
+    set @sql = [changefeed].sql_create_feed_write_lock_procedure(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+
+    -- create [update_state:<tablename>]
+    set @sql = [changefeed].sql_create_update_state_procedure(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+
+    -- create [read_feed:<tablename>]
+    set @sql = [changefeed].sql_create_read_procedure(
+            @object_id,
+            @changefeed_schema);
+    exec sp_executesql @sql;
+end
+
+go
+
+create or alter procedure [changefeed].setup_feed(
     @table_name nvarchar(max)
 )
 as begin
@@ -603,29 +647,14 @@ as begin
             @changefeed_schema);
     exec sp_executesql @sql;
 
-    -- create [feed_write_lock:<tablename>]
-    set @sql = [changefeed].sql_create_feed_write_lock_procedure(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
-
-    -- create [update_state:<tablename>]
-    set @sql = [changefeed].sql_create_update_state_procedure(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
-
-    -- create [read_feed:<tablename>]
-    set @sql = [changefeed].sql_create_read_procedure(
-        @object_id,
-        @changefeed_schema);
-    exec sp_executesql @sql;
+    -- Stored procedures done by upgrade_feed...
+    exec [changefeed].upgrade_feed @table_name;
 end
 
 
 go
 
-create function [changefeed].ulid(@sequence_sample bigint) returns binary(16)
+create or alter function [changefeed].ulid(@sequence_sample bigint) returns binary(16)
 as begin
     return convert(binary(8), session_context(N'changefeed.ulid_high'))
         + convert(binary(8),
