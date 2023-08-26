@@ -203,7 +203,7 @@ create or alter function [changefeed].sql_create_feed_write_lock_procedure(
 -- before updating the shard state (in order to know what timestamps are in the outbox)
 create or alter procedure ', @lock_proc, '(
     @shard_id int,
-    @lock_timeout int = -1,  -- same as sp_getallock
+    @lock_timeout int = -1,  -- passed straight to sp_getapplock
     @lock_result int output
 ) as begin
     declare @lockname varchar(max) = concat(''changefeed/', @object_id, '/'', @shard_id)
@@ -212,39 +212,6 @@ create or alter procedure ', @lock_proc, '(
         @LockMode = ''Exclusive'',
         @LockOwner = ''Transaction'',
         @LockTimeout = @lock_timeout;
-end;
-')
-end;
-
-go
-
-create or alter function [changefeed].sql_create_lock_procedure(
-    @object_id int,
-    @changefeed_schema nvarchar(max)
-) returns nvarchar(max) as begin
-    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
-
-    declare @state_table nvarchar(max) = concat(
-            quotename(@changefeed_schema),
-            '.',
-            quotename(concat('state:', @unquoted_qualified_table_name)))
-
-    declare @lock_proc nvarchar(max) = concat(
-            quotename(@changefeed_schema),
-            '.',
-            quotename(concat('lock:', @unquoted_qualified_table_name)))
-
-    return concat('
-create or alter procedure ', @lock_proc, '(
-    -- Default is to allocate a very large @count; the next lock within the same millisecond will start
-    -- after this number added to the one we allocate first. We assume 2^40 ULIDs generated in each
-    -- transaction (including waste due to concurrent use of changefeed.sequence), leaving room for
-    -- 2^23 transactions to execute on the same shard in the same millisecond...
-    @count bigint = 1099511627776,
-
-) as begin
-
-
 end;
 ')
 end;
@@ -381,11 +348,6 @@ returns nvarchar(max) as begin
             '.',
             quotename(concat('read_feed:', @unquoted_qualified_table_name)))
 
-    declare @rawlock_proc nvarchar(max) = concat(
-            quotename(@changefeed_schema),
-            '.',
-            quotename(concat('rawlock:', @unquoted_qualified_table_name)))
-
     declare @feed_write_lock_proc nvarchar(max) = concat(
             quotename(@changefeed_schema),
             '.',
@@ -431,7 +393,7 @@ as begin
 
         -- Use an application lock to make sure only one session will
         -- process the outbox at the time. However, the shard state itself
-        -- is really protected by the `update` statement in rawlock:, not
+        -- is really protected by the `update` statement in the update_state procedure, not
         -- this lock. I.e. this lock *only* protects consumption of the outbox
         -- and that those using read_feed sees a consistent picture.
 
