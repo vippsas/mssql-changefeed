@@ -1,4 +1,4 @@
-# mssql-changefeed: Changefeed SQL library for SQL Server
+# mssql-changefeed: MS-SQL library for in-database event "broker"
 
 ## Event broker in SQL
 The mssql-changefeed library provides a "mini event broker", or pub/sub features,
@@ -18,43 +18,74 @@ Log based event brokering is very simple in principle,
 as the idea is the publisher simply stores events in a log table
 (one log per shard/partition).
 
-Why is this not as simple as having a "RowID", such as
+One may think that implementing this pattern is as simple as having an auto-increment
+"RowID", such as
 ```sql
 create table myservice.MyEvent (
     RowID int not null identity,
     ...
 )
 ```
-and then simply have consumers `select ... where RowID > @LastReadRowID`?
-The problem with such an implementation is that there will be
+and then consumers may fetch a new set of events by
+```sql
+select ... where RowID > @LastReadRowID`
+```
+This is however not safe. There will be
 race conditions between the publisher side and the consumer side
 (assuming inserts to the table is done in parallel).
-This is the fundamental problem solved by mssql-changefeed.
-See [MOTIVATION.md](MOTIVATION.md) for further descriptions
+The mssql-changefeed library provides race-safe patterns for achieving
+an event log like this. See [MOTIVATION.md](MOTIVATION.md) for further descriptions
 of the race condition.
 
 
 ### About ULIDs
 
 mssql-changefeed makes an opinionated choice of using [ULIDs](https://github.com/ulid/spec)
-as "event sequence numbers". This allows for generating cursor values
-that embed a timestamp, and you get unique IDs for your events that are ensured
-to be in sequence. Also, the use of ULIDs makes changing the number of partitions
-an easier affair.
+as "event sequence numbers". The disadvantage of this scheme is the storage cost.
+The advantages are:
+* Since each event ID embeds a timestamp, it will always be possible to navigate to a set
+  of historical events based on time
+* It is easier to change the number of partitions
+* It's never a problem to backfill older events into a feed, and similar cases
 
 The library would have worked equally well with integer sequence numbers;
-it could be made an option in the future.
+this could be made an option in the future.
 
 The ULIDs are stored as `binary(16)`, not in the the string crockford32
 encoding.
 
+
+### Feed types
+
+The library provides two different mechanisms to maintain a feed:
+
+* Outbox pattern
+  * Pro: Writers are not blocked and operate fully in parallel
+  * Con: The assigned ULIDs is not available at the time of the write
+    happening.
+  * Con: Consuming the feed happens using a stored procedure
+* Serialize writers. Only one writer gets a lock at the time, for each
+  feed and partition.
+  * Pro: The ULID is known at the time of writing, so it can for instance be used as a primary key.
+  * Pro: The feed can safely be consumed directly by querying the table on the ULID column,
+    without using a stored procedure
+  * Con: You risk [blocking all writes for 60 seconds](POWEROFF.md) if you use
+    client-side transactions.
+
+Which you use depend on the usecase. The former is likely best for typical backend
+APIs that insert individual events. The latter may perform better for high-through
+batch-style processing where each SQL statement touches 1000+ rows. If you are in
+doubt, and do not need to use the ULID as the primary key of your table,
+go with the Outbox pattern.
+
 ## Installation
 
-### Migrations
 Copy the file(s) in the `migrations` directory and run them in the database.
 The standard is to create tables and stored procedures in a `changefeed`
 schema (the migration file is written such that you can globally search and replace
 `[changefeed]` to change the schema name).
+
+## Usage
 
 ### Feed setup
 
@@ -65,32 +96,13 @@ migration files.
 exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @outbox = 1;
 alter role [changefeed].[role:myservice.MyEvent] add member myservice_user;    
 ```
+
+For the outbox pattern, pass `@outbox = 1` like above, while for the serialized writers mode
+pass `@serialize_writers = 1`.
+
 Calling this stored procedure will generate tables
 and stored procedures tailored for your table; in particular
 the primary keys of the table is embedded.
-The [REFERENCE.md](REFERENCE.md) has more information about
-what is generated.
-
-## Usage
-
-There are two different options for how to use the library, which one to use
-depends on your context. For most real world usecases, *both* are acceptable.
-
-* Outbox pattern
-  * Pro: Writers are not blocked and operate fully in parallel
-  * Con: The assigned ULIDs is not available at the time of the write
-    happening.
-* Serialize writers. Only one writer gets a lock at the time, for each
-  feed and partition.
-  * Pro: The ULID is known at the time of writing, so it can for instance be used as a primary key.
-  * Con: You risk [blocking all writes for 60 seconds](POWEROFF.md) if you use
-    client-side transactions.
-
-In general, choose the outbox pattern for "OLTP" workloads where you do lots
-of single-row inserts in parallel. For more batch-oriented workloads
-where you write largers chunks of data at the time, you may choose
-either approach.
-
 
 ### Outbox pattern
 
@@ -112,7 +124,7 @@ insert into myservice.MyEvent (AggregateID, Version, ChosenShoeSize)
 insert into [changefeed].[outbox:myservice.MyEvent] (shard_id, time_hint, AggregateID, Version)
 values (1000 % 2, '2023-05-31 12:00:00', 1000, 1);
 ```
-You can do this extra insert either in the backend code, or using a trigger in SQL
+You can do this extra insert either in the backend code, or by using a trigger in SQL
 (that you provide). Make sure both inserts happen in the same database
 transaction!
 
@@ -136,10 +148,14 @@ order by ulid;
 ```
 To consume the feed, the maximum `ulid` returned should be stored and used as `@cursor` in the next
 iteration. The `changefeed.read_feed:*` procedure will first attempt
-to read from `changefeed.feed:*` (which you should never insert into directly).
-If there are no results, it will process the
+to read from `changefeed.feed:*`. If there are no new entries, it will process the
 `changefeed.outbox:*` table, assign ULIDs, and both write the rows
 to `changefeed.feed:*` for future lookups as well as returning them.
+
+You should not insert into `changefeed.feed:*` directly, unless if you are
+backfilling old data. Such data inserted manually into the feed will not be
+seen by currently active consumers reading from the head of the feed. Never
+insert near the head of `changefeed.feed:*` as you risk triggering race conditions.
 
 ### Serializing writers
 
@@ -149,30 +165,49 @@ to `changefeed.feed:*` for future lookups as well as returning them.
   [blocking all writes for 60 seconds](POWEROFF.md).
 
 In this method, we generate the ULIDs *before* they are needed
-and simply write them as ordinary data. When setting up the feed you
+and simply write them as ordinary data. This means you will have some table
+similar to this:
+```sql
+create table myservice.MyEvent(
+    Shard smallint not null,
+    ULID binary(16) not null,
+    UserID bigint not null,
+    ChosenShoeSize tinyint not null,
+    constraint pk_MyEvent primary key (Shard, ULID)
+) with (data_compression = page);
+```
+To support reading from the feed you should make available a unique
+index on `(Shard, ULID)`, in this case we make it the primary key of our table.
+
+Then when setting up the feed you
 want to use the `@serialize_writers=1` option instead:
 
 ```sql
 exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @serialize_writers = 1;
 ```
-Note: The state table is under the hood the same, so it would be possible in the future to develop
+(The state table is under the hood the same, so it would be possible in the future to develop
 some compatability so that *both* approaches can be used at the same time,
-if needed.
+if needed.)
 
 To avoid the [power-off issue](POWEROFF.md) we use a server-side transaction
 inside the SQL batch in our example:
 ```sql
+-- Quite a lot of boilerplate to do safe error handling in MS-SQL;
+-- see Erland Sommarkog's excellent guide one errors for more detail:
+-- https://www.sommarskog.se/error_handling/Part1.html
+set xact_abort on
 begin try
     
     begin transaction
 
-    exec changefeed.[lock:myservice.MyEvent] @shard_id = 0;
-        
-    insert into myservice.MyEvent (ULID, UserID, ChosenShoeSize)
+    -- The first thing we do in our transaction is lock our shard for writes by us.
+    exec changefeed.[lock_feed:myservice.MyEvent] @shard_id = 0;
+    
+    -- Proceed with inserting, generating ULIDs in the right order
+    insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
     select
-        changefeed.ulid(next value for changefeed.sequence over (order by i.UserID))
-    from @inputtable as i
-    values (1000, 1, 38);
+        changefeed.ulid(next value for changefeed.sequence over (order by i.Time))
+    from @inputtable as i;
         
     commit
 
@@ -183,9 +218,16 @@ begin catch
 end catch
 ```
 
-The call to `ulid_begin:*` takes a lock, so that other writers to the same
+The call to `lock_feed:*` takes a lock so that other writers to the same
 shard will stop at that location (serializing writers). After this call,
-it is possible to call `changefeed.ulid(next value for changefeed.sequence)`
+it is possible to call `changefeed.ulid(next value for changefeed.sequence)`.
+All the ULIDs generated in the same database transaction will have the same
+timestamp.
+
+In the example above, the `over` clause is used on `next value for` t
+to generate a single ULID, or use `changefeed.ulid(next value for changefeed.sequence over (order by ...))`
+to generate a large number of UILD
+
 which generates any number of ULIDs. See reference for more
 details.
 
