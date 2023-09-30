@@ -142,6 +142,3 @@ begin transaction
 commit
 ```
 
-## Still curious?
-
-Head over to the [experts guide](EXPERTS-GUIDE.md).

@@ -110,7 +110,3 @@ You should not insert into `changefeed.feed:*` directly, unless if you are
 backfilling old data. Such data inserted manually into the feed will not be
 seen by currently active consumers reading from the head of the feed. Never
 insert near the head of `changefeed.feed:*` as you risk triggering race conditions.
-
-## Still curious?
-
-Head over to the [experts guide](EXPERTS-GUIDE.md).

@@ -1,4 +1,3 @@
-
 create schema [changefeed];
 
 go
@@ -99,8 +98,7 @@ as begin
 
     time datetime2(3) not null,
 
-    -- See EXPERTS-GUIDE.md for description of ulid_prefix
-    -- and ulid_low.
+    -- See ULID-NOTES.md for description of ulid_high and ulid_low.
     ulid_high binary(8) not null,
     ulid_low bigint not null,
 
@@ -281,7 +279,7 @@ as begin
           , ulid_low_range_start = (case
               when @time_hint > shard_state.time then
                   -- Start ulid_low in new, random place.
-                  -- The mask 0xbfffffffffffffff will zero out bit 63, ensuring that overflows will not happen
+                  -- The mask 0xbfffffffffffffff will zero out second-highest bit, ensuring that overflows will not happen
                   -- as the caller adds numbers to this
                   convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff
               else

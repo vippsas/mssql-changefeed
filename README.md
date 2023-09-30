@@ -65,6 +65,8 @@ Encoding/decoding to crockford32 is strictly optional and should be done on your
 but the bits stored in the `binary(16)` are exactly according to the ULID specification;
 in particular the first 6 bytes contains an encoded timestamp.
 
+There is a [separate page about how we generate ULIDs](ULID-NOTES.md).
+
 ## Which mode to use?
 
 We have gone through *many* iterations of possible patterns to do race-safe, Kafka-like
@@ -94,7 +96,6 @@ different mode. For most needs, *both* methods will do the job nicely.
     * As a consequence the ULID can not be used as a primary key
 
 Each mode has its own user manual, so please click one of the links above.
-If you want to really understand the library there is also the [expert's guide](EXPERTS-GUIDE.md).
 
 
 ## Versions

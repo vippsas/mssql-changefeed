@@ -118,7 +118,6 @@ insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, A
 		AggregateID bigint not null,
 		Version int not null	    
 	);
-	declare @cursorbin binary(16) = convert(binary(16), @cursor)
 	exec [changefeed].[read_feed:myservice.TestHappyDay] 0, 0x0, 100;
 	select AggregateID, Version from #read order by ulid;
 `, sql.Named("cursor", page1[1][0]))
