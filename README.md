@@ -1,23 +1,12 @@
 # mssql-changefeed: MS-SQL library for in-database event "broker"
 
-## Event broker in SQL
 The mssql-changefeed library provides a "mini event broker", or pub/sub features,
-inside of your
-Microsoft SQL database; by provisioning a few SQL tables and providing
-race-safe patterns around using them. This can be useful for code executing
-on your SQL server, or as a building block to export events from your
-service (whether live events or older, historical events).
+inside of your Microsoft SQL database. This allows you to use programming patterns
+known from Kafka etc., in a convenient (enough) way.
 
-The "Outbox pattern" is often used to export live events. This library
-can bee seen as a library providing "re-usable outboxes";
-allowing to use the outbox several time for exporting events to several
-places, or re-publishing older events.
-
-The model used is the "partitioned log" model popularized by Kafka.
+The "partitioned log" model was popularized by Kafka.
 Log based event brokering is very simple in principle,
-as the idea is the publisher simply stores events in a log table
-(one log per shard/partition).
-
+as the idea is the publisher simply stores events in a log table.
 One may think that implementing this pattern is as simple as having an auto-increment
 "RowID", such as
 ```sql
@@ -30,18 +19,38 @@ and then consumers may fetch a new set of events by
 ```sql
 select ... where RowID > @LastReadRowID`
 ```
-This is however not safe. There will be
+However, this is not race safe. There will be
 race conditions between the publisher side and the consumer side
 (assuming inserts to the table is done in parallel).
 The mssql-changefeed library provides race-safe patterns for achieving
 an event log like this. See [MOTIVATION.md](MOTIVATION.md) for further descriptions
 of the race condition.
 
+## Installation and usage
 
-### About ULIDs
+The Go code in this library *is only for testing purposes*. The library
+itself is in pure Microsoft SQL.
+
+To install it, execute the file [migrations/2001.changefeed-v2.sql](migrations/2001.changefeed-v2.sql)
+on your SQL server. This will create and populate the `changefeed` schema.
+
+Further usage depends on which of the two available modes you use, as described below.
+
+## Fundamental concept: Assign ULIDs to events in a race-safe manner.
+
+The fundamental idea is to store your events in a regular SQL table, much
+like the example above. 
+
+Event writers `insert` a row to a table, and also make use of mssql-changefeed
+to assign an event sequence number in a race-safe manner.
+ 
+Consumers keep track of a *cursor* for each *partition*. Running one loop for each
+partition, they query for events newer than the current cursor, and process the events
+and update the cursor (ideally in the same database transaction, for *exactly-once*
+processing).
 
 mssql-changefeed makes an opinionated choice of using [ULIDs](https://github.com/ulid/spec)
-as "event sequence numbers". The disadvantage of this scheme is the storage cost.
+as event sequence numbers. The disadvantage of this scheme is the storage cost.
 The advantages are:
 * Since each event ID embeds a timestamp, it will always be possible to navigate to a set
   of historical events based on time
@@ -51,192 +60,42 @@ The advantages are:
 The library would have worked equally well with integer sequence numbers;
 this could be made an option in the future.
 
-The ULIDs are stored as `binary(16)`, not in the the string crockford32
-encoding.
+There is no built in type for ULID in MS SQL, so we simply use the type `binary(16)`.
+Encoding/decoding to crockford32 is strictly optional and should be done on your backend;
+but the bits stored in the `binary(16)` are exactly according to the ULID specification;
+in particular the first 6 bytes contains an encoded timestamp.
 
+## Which mode to use?
 
-### Feed types
+We have gone through *many* iterations of possible patterns to do race-safe, Kafka-like
+event processing on SQL tables. In the end there wasn't a single winner and we provide two
+different mode. For most needs, *both* methods will do the job nicely.
 
-The library provides two different mechanisms to maintain a feed:
+* [Blocking mode](Bl.md):
+  * The idea is to serialize writers (for each partition) using traditional `update` locking
+    * Scaling up throughput requires increasing number of partitions
+  * This is the "least intrusive" method, simplest to understand and use
+  * Recommended option for batch-like processing
+  * If you use client-side transactions, you risk [blocking all writes for 60 seconds](POWEROFF.md)
+    * May not be appropriate for very high-uptime scenarios combined with client-side transactions
+    * Note: Client-side transactions are seldom needed; stored procedures running transactions
+      will usually lead to higher performance as they reduce the number of network roundtrips.
 
-* Outbox pattern
-  * Pro: Writers are not blocked and operate fully in parallel
-  * Con: The assigned ULIDs is not available at the time of the write
-    happening.
-  * Con: Consuming the feed happens using a stored procedure
-* Serialize writers. Only one writer gets a lock at the time, for each
-  feed and partition.
-  * Pro: The ULID is known at the time of writing, so it can for instance be used as a primary key.
-  * Pro: The feed can safely be consumed directly by querying the table on the ULID column,
-    without using a stored procedure
-  * Con: You risk [blocking all writes for 60 seconds](POWEROFF.md) if you use
-    client-side transactions.
+* [Outbox pattern](OUTBOX.md) mode:
+  * The idea is that the writer stores events in a special semi-ordered outbox data structure;
+    in such a way that ULIDs can be assigned by the first reader.
+  * A bit harder to learn to use; in particularly on the consumption side
+  * Writers are more decoupled from mssql-changefeed library
+    * Risk of blocking all writes for 60 seconds is eliminated; client-side transactions
+      can safely be used
+    * If the number of partitions is too low, it is primarily the readers that are hurt,
+      writers are less affected by locks.
+  * Problem: The ULIDs assigned are not available at the time of doing the insert
+    * As a consequence the ULID can not be used as a primary key
 
-Which you use depend on the usecase. The former is likely best for typical backend
-APIs that insert individual events. The latter may perform better for high-through
-batch-style processing where each SQL statement touches 1000+ rows. If you are in
-doubt, and do not need to use the ULID as the primary key of your table,
-go with the Outbox pattern.
+Each mode has its own user manual, so please click one of the links above.
+If you want to really understand the library there is also the [expert's guide](EXPERTS-GUIDE.md).
 
-## Installation
-
-Copy the file(s) in the `migrations` directory and run them in the database.
-The standard is to create tables and stored procedures in a `changefeed`
-schema (the migration file is written such that you can globally search and replace
-`[changefeed]` to change the schema name).
-
-## Usage
-
-### Feed setup
-
-You set up a new feed by calling a stored procedure,
-passing in the name of a table, in one of your own
-migration files.
-```sql
-exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @outbox = 1;
-alter role [changefeed].[role:myservice.MyEvent] add member myservice_user;    
-```
-
-For the outbox pattern, pass `@outbox = 1` like above, while for the serialized writers mode
-pass `@serialize_writers = 1`.
-
-Calling this stored procedure will generate tables
-and stored procedures tailored for your table; in particular
-the primary keys of the table is embedded.
-
-### Outbox pattern
-
-* Pro: Writers are not blocked
-* Con: Generated ULIDs not available at the time of write
-
-Call `setup_feed` using `@outbox=1`, as in the example above.
-
-Whenever you insert into your main event table, you must make
-sure to always also insert into an *outbox table*:
-```sql
--- the event table looks however you want; in this example,
--- the primary key is (AggregateID, Version)
-insert into myservice.MyEvent (AggregateID, Version, ChosenShoeSize)
-    values (1000, 1, 38);
-
--- Also always insert into the outbox. The last columns
--- are the primary key of your table
-insert into [changefeed].[outbox:myservice.MyEvent] (shard_id, time_hint, AggregateID, Version)
-values (1000 % 2, '2023-05-31 12:00:00', 1000, 1);
-```
-You can do this extra insert either in the backend code, or by using a trigger in SQL
-(that you provide). Make sure both inserts happen in the same database
-transaction!
-
-Now, the ULIDs which determines the final ordering of the event
-on the feed is actually not generated yet. This is generated *the first*
-time the feed is read; and to organize this, all readers need to consume
-the feed by calling a stored procedure. Example read:
-```sql
-create table #read (
-    -- always here:
-    ulid binary(16) not null,
-    -- primary keys of your particular table:
-	AggregateID bigint not null,
-	Version int not null	    
-);
-exec [changefeed].[read_feed:myservice.MyEvent] @shard, @cursor, @pagesize
-select * from #read as r
-join myservice.MyEvent as e
-    on r.AggregateID = e.AggregateID and r.Version = e.Version 
-order by ulid;
-```
-To consume the feed, the maximum `ulid` returned should be stored and used as `@cursor` in the next
-iteration. The `changefeed.read_feed:*` procedure will first attempt
-to read from `changefeed.feed:*`. If there are no new entries, it will process the
-`changefeed.outbox:*` table, assign ULIDs, and both write the rows
-to `changefeed.feed:*` for future lookups as well as returning them.
-
-You should not insert into `changefeed.feed:*` directly, unless if you are
-backfilling old data. Such data inserted manually into the feed will not be
-seen by currently active consumers reading from the head of the feed. Never
-insert near the head of `changefeed.feed:*` as you risk triggering race conditions.
-
-### Serializing writers
-
-* Pro: Generated ULIDs available at time of write / before commit
-* Con: Writers are serialized (within their allocated `shard_id`)
-* Con: If you have client-managed transactions, you run the risk of
-  [blocking all writes for 60 seconds](POWEROFF.md).
-
-In this method, we generate the ULIDs *before* they are needed
-and simply write them as ordinary data. This means you will have some table
-similar to this:
-```sql
-create table myservice.MyEvent(
-    Shard smallint not null,
-    ULID binary(16) not null,
-    UserID bigint not null,
-    ChosenShoeSize tinyint not null,
-    constraint pk_MyEvent primary key (Shard, ULID)
-) with (data_compression = page);
-```
-To support reading from the feed you should make available a unique
-index on `(Shard, ULID)`, in this case we make it the primary key of our table.
-
-Then when setting up the feed you
-want to use the `@serialize_writers=1` option instead:
-
-```sql
-exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @serialize_writers = 1;
-```
-(The state table is under the hood the same, so it would be possible in the future to develop
-some compatability so that *both* approaches can be used at the same time,
-if needed.)
-
-To avoid the [power-off issue](POWEROFF.md) we use a server-side transaction
-inside the SQL batch in our example:
-```sql
--- Quite a lot of boilerplate to do safe error handling in MS-SQL;
--- see Erland Sommarkog's excellent guide one errors for more detail:
--- https://www.sommarskog.se/error_handling/Part1.html
-set xact_abort on
-begin try
-    
-    begin transaction
-
-    -- The first thing we do in our transaction is lock our shard for writes by us.
-    exec changefeed.[lock:myservice.MyEvent] @shard_id = 0;
-    
-    -- Proceed with inserting, generating ULIDs in the right order
-    insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
-    select
-        changefeed.ulid(next value for changefeed.sequence over (order by i.Time))
-    from @inputtable as i;
-        
-    commit
-
-end try
-begin catch
-    if @@trancount > 0 rollback;
-    ;throw;
-end catch
-```
-
-The call to `lock_feed:*` takes a lock so that other writers to the same
-shard will stop at that location (serializing writers). After this call,
-it is possible to call `changefeed.ulid(next value for changefeed.sequence)`.
-All the ULIDs generated in the same database transaction will have the same
-timestamp.
-
-In the example above, the `over` clause is used on `next value for` t
-to generate a single ULID, or use `changefeed.ulid(next value for changefeed.sequence over (order by ...))`
-to generate a large number of UILD
-
-which generates any number of ULIDs. See reference for more
-details.
-
-
-
-
-## Still curious?
-
-Head over to the [experts guide](EXPERTS-GUIDE.md).
 
 ## Versions
 Note: Version 1 used a rather different approach. It is
