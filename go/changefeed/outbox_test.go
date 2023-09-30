@@ -40,7 +40,7 @@ func TestIntegerConversionMssqlAndGo(t *testing.T) {
 	assert.Equal(t, "ffffffffffffffff", fmt.Sprintf("%x", uint64(minusOne)))
 }
 
-func TestHappyDay(t *testing.T) {
+func TestHappyDayOutbox(t *testing.T) {
 	_, err := fixture.DB.ExecContext(context.Background(),
 		`exec [changefeed].setup_feed 'myservice.TestHappyDay'`)
 	require.NoError(t, err)

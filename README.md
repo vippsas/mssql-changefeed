@@ -201,7 +201,7 @@ begin try
     begin transaction
 
     -- The first thing we do in our transaction is lock our shard for writes by us.
-    exec changefeed.[lock_feed:myservice.MyEvent] @shard_id = 0;
+    exec changefeed.[lock:myservice.MyEvent] @shard_id = 0;
     
     -- Proceed with inserting, generating ULIDs in the right order
     insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)

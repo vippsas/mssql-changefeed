@@ -301,7 +301,7 @@ as begin
             set @next_ulid_low = convert(bigint, substring(@random_bytes, 3, 8)) & 0xbfffffffffffffff;;
 
             insert into ', @state_table, ' (shard_id, time, ulid_high, ulid_low)
-            values (@shard_id, @next_time, @next_ulid_high, @next_ulid_low);
+            values (@shard_id, @next_time, @next_ulid_high, @next_ulid_low + @count);
         end
 
     end try
@@ -535,15 +535,80 @@ end
 
 go
 
+create or alter function [changefeed].sql_create_lock_procedure(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+)
+    returns nvarchar(max) as begin
+    -- re-generate table name in a certain format from sys tables;
+    -- @table_name can be quoted in different ways. We use unquoted, but qualified,
+    -- name; e.g. [myschema.with.dot].[table.with.dot] will turn into
+    -- myschema.with.dot.table.with.dot. In theory this can be ambigious, but assume
+    -- noone will use names like this.
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @lock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('lock:', @unquoted_qualified_table_name)))
+
+    declare @update_state_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('update_state:', @unquoted_qualified_table_name)))
+
+    return concat('create or alter procedure ', @lock_proc, '(
+    @shard_id int,
+    @time_hint datetime2(3) = null
+) as begin
+    set xact_abort, nocount on;
+    begin try
+        if @@trancount = 0 throw 77100, ''', @lock_proc, ': please call inside a transaction'', 0;
+
+        if @time_hint is null set @time_hint = sysutcdatetime();
+
+        declare @next_ulid_high binary(8);
+        declare @next_ulid_low bigint;
+
+        exec ', @update_state_proc, '
+            @shard_id = @shard_id,
+            @time_hint = @time_hint,
+            @count = 100000000000,  -- 10^11
+            @next_ulid_high = @next_ulid_high output,
+            @next_ulid_low = @next_ulid_low output;
+
+        exec sp_set_session_context N''changefeed.ulid_high'', @next_ulid_high;
+        exec sp_set_session_context N''changefeed.ulid_low'', @next_ulid_low;
+        declare @transaction_id bigint = current_transaction_id();
+        exec sp_set_session_context N''changefeed.transaction_id'', @transaction_id;
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        throw;
+    end catch
+end
+
+')
+
+
+end
+
+go
+
 -- upgrade_feed is called if setup_feed has earlier been called to upgrade to a new version.
 -- right now this only supports to re-run all stored procedures as `create or alter`, allowing
 -- code updates in the stored procedures without affecting the tables created
 create or alter procedure [changefeed].upgrade_feed(
-    @table_name nvarchar(max)
+    @table_name nvarchar(max),
+    @outbox bit = 0,
+    @serialize_writers bit = 0
 )
 as begin
     declare @object_id int = object_id(@table_name, 'U');
     if @object_id is null throw 71000, 'Could not find @table_name', 0;
+
+    if @outbox = 0 and @serialize_writers = 0
+        throw 55000, '[changefeed].setup_feed: please pass either @outbox=1 or @serialize_writers=1', 1;
 
     -- in order to be able to search/replace [changefeed] in this script, this is bit weird:
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
@@ -563,21 +628,36 @@ as begin
             @changefeed_schema);
     exec sp_executesql @sql;
 
-    -- create [read_feed:<tablename>]
-    set @sql = [changefeed].sql_create_read_procedure(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
+    if @outbox = 1
+    begin
+        -- create [read_feed:<tablename>]
+        set @sql = [changefeed].sql_create_read_procedure(
+                @object_id,
+                @changefeed_schema);
+        exec sp_executesql @sql;
+    end
+
+    if @serialize_writers = 1
+    begin
+        set @sql = [changefeed].sql_create_lock_procedure(@object_id, @changefeed_schema);
+        exec sp_executesql @sql;
+    end
+
 end
 
 go
 
 create or alter procedure [changefeed].setup_feed(
-    @table_name nvarchar(max)
+    @table_name nvarchar(max),
+    @outbox bit = 0,
+    @serialize_writers bit = 0
 )
 as begin
     declare @object_id int = object_id(@table_name, 'U');
     if @object_id is null throw 71000, 'Could not find @table_name', 0;
+
+    if @outbox = 0 and @serialize_writers = 0
+        throw 55000, '[changefeed].setup_feed: please pass either @outbox=1 or @serialize_writers=1', 1;
 
     -- in order to be able to search/replace [changefeed] in this script, this is bit weird:
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
@@ -591,37 +671,42 @@ as begin
             @changefeed_schema);
     exec sp_executesql @sql;
 
-    -- create [feed:<tablename>]
-    set @sql = [changefeed].sql_create_feed_table(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
+    if @outbox = 1
+    begin
+        -- create [feed:<tablename>]
+        set @sql = [changefeed].sql_create_feed_table(
+                @object_id,
+                @changefeed_schema);
+        exec sp_executesql @sql;
 
-    -- create [outbox:read:<tablename>]
-    set @sql = [changefeed].sql_create_outbox_table(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
+        -- create [outbox:read:<tablename>]
+        set @sql = [changefeed].sql_create_outbox_table(
+                @object_id,
+                @changefeed_schema);
+        exec sp_executesql @sql;
 
-    -- create [type:read:<tablename>]
-    set @sql = [changefeed].sql_create_read_type(
-            @object_id,
-            @changefeed_schema);
-    exec sp_executesql @sql;
+        -- create [type:read:<tablename>]
+        set @sql = [changefeed].sql_create_read_type(
+                @object_id,
+                @changefeed_schema);
+        exec sp_executesql @sql;
+
+    end
 
     -- Stored procedures done by upgrade_feed...
-    exec [changefeed].upgrade_feed @table_name;
+    exec [changefeed].upgrade_feed @table_name, @outbox = @outbox, @serialize_writers = @serialize_writers;
 end
-
 
 go
 
-create or alter function [changefeed].ulid(@sequence_sample bigint) returns binary(16)
+create or alter function [changefeed].ulid(@i bigint) returns binary(16)
 as begin
-    return convert(binary(8), session_context(N'changefeed.ulid_high'))
-        + convert(binary(8),
-                       convert(bigint, session_context(N'changefeed.ulid_low'))
-                       + (@sequence_sample - convert(bigint, session_context(N'changefeed.sequence_start')))
-               );
+    return (case
+        -- protect against calling ulid(); it cannot raise error but make sure we return null
+        when isnull(try_convert(bigint, session_context(N'changefeed.transaction_id')), 0) = current_transaction_id()
+            then convert(binary(8), session_context(N'changefeed.ulid_high')) + convert(binary(8), convert(bigint, session_context(N'changefeed.ulid_low')) + @i)
+        else convert(binary(16), convert(int, 'error: changefeed.ulid must be called in a transaction, and after having called changefeed.lock:*'))
+    end)
 end
+
 

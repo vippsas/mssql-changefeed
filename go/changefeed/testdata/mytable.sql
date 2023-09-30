@@ -27,3 +27,8 @@ create table myservice.MultiPK (
     primary key (x, y, z)
 )
 
+create table myservice.TestSerializeWriters (
+    EventID binary(16) primary key,
+    Data varchar(max) not null,
+);
+

@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"reflect"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -138,6 +140,13 @@ func QueryInt(dbi CtxQuerier, qry string, args ...interface{}) (result int) {
 	return
 }
 
+func QueryT[T any](dbi CtxQuerier, qry string, args ...interface{}) (result T) {
+	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
+		panic(errors.WithStack(err))
+	}
+	return
+}
+
 func QueryString(dbi CtxQuerier, qry string, args ...interface{}) (result string) {
 	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
 		panic(errors.WithStack(err))
@@ -160,4 +169,132 @@ func QueryDump(dbi interface{}, qry string, args ...interface{}) {
 
 	rows := runQuery(dbi, qry, args...)
 	DumpRows(rows)
+}
+
+func StructSlice2[T any](ctx context.Context, querier CtxQuerier, qry string, args ...interface{}) (result []T, err error) {
+	var x T
+	err = Structs(ctx, querier, &x, func() error {
+		result = append(result, x)
+		return nil
+	}, qry, args...)
+	return
+}
+func Structs(ctx context.Context, querier CtxQuerier, pointerToStruct interface{}, next func() error, qry string, args ...interface{}) error {
+	// Avoid nil pointer errors and invalid API use
+	if querier == nil {
+		return errors.Errorf("querier cannot be nil")
+	}
+	if pointerToStruct == nil {
+		return errors.Errorf("pointerToStruct cannot be nil!")
+	}
+	if reflect.TypeOf(pointerToStruct).Kind() != reflect.Ptr {
+		return errors.Errorf("Expecting pointerToStruct to be a pointer to a struct, did you forget a '&'?")
+	}
+	if reflect.ValueOf(pointerToStruct).IsNil() {
+		return errors.Errorf("pointerToStruct cannot be nil!")
+	}
+
+	rows, err := querier.QueryContext(ctx, qry, args...)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+
+	// Closing rows is critical to return db connection to pool
+	defer rows.Close()
+
+	ptrs, err := GetPointersToFields(rows, pointerToStruct)
+	if err != nil {
+		return err
+	}
+
+	// Scan each row and call next
+	for rows.Next() {
+		// Scan a row into the reordered pointers
+		if err := rows.Scan(ptrs...); err != nil {
+			return errors.WithStack(err)
+		}
+		// Call next closure to tell our caller to consume the single struct value
+		if err := next(); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	// This final error check is important, and easily forgotten
+	if err := rows.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func GetPointersToFields(rows *sql.Rows, pointerToStruct interface{}) ([]interface{}, error) {
+	// Gets the names of columns in the query
+	columns, err := rows.Columns()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for i, name := range columns {
+		columns[i] = canonicalName(name)
+	}
+
+	// Get the names of struct fields, recursing into embedded structs
+	names := DeepFieldNames(pointerToStruct)
+	for i, name := range names {
+		names[i] = canonicalName(name)
+	}
+
+	// Build a mapping from name to index, this index is
+	// both for names[i] and origPtrs[i]
+	name2index := make(map[string]int, len(names))
+	for i, name := range names {
+		name2index[name] = i
+	}
+
+	// Get pointers in ordering determined by struct
+	origPtrs := DeepFieldPointers(pointerToStruct)
+
+	// Reorder pointers to match query column order
+	ptrs := make([]interface{}, 0, len(columns))
+	mappedNames := make([]string, 0, len(columns))
+	n := 0
+	for _, col := range columns {
+		if j, ok := name2index[col]; ok {
+			ptrs = append(ptrs, origPtrs[j])
+			mappedNames = append(mappedNames, names[j])
+			n++
+		}
+	}
+
+	// Demand that all fields in struct gets filled
+	if n != len(names) {
+		diff := stringSliceDiff(names, columns)
+		return nil, errors.Errorf("Failed to map all struct fields to query columns (names: %v, columns: %v, diff: %v)", names, columns, diff)
+	}
+
+	// Demand that all query columns gets scanned
+	if len(columns) > len(ptrs) {
+		diff := stringSliceDiff(names, columns)
+		return nil, errors.Errorf("Failed to map all query columns to struct fields (names: %v, columns: %v, diff: %v)", names, columns, diff)
+	}
+	return ptrs, nil
+}
+
+func stringSliceDiff(a, b []string) map[string]int {
+	diff := map[string]int{}
+	for _, name := range a {
+		diff[name] = diff[name] + 1
+	}
+	for _, name := range b {
+		diff[name] = diff[name] - 1
+	}
+	for name, count := range diff {
+		if count == 0 {
+			delete(diff, name)
+		}
+	}
+	return diff
+}
+
+// Map field/column name to canonical name for matching
+func canonicalName(name string) string {
+	return strings.ToLower(name)
 }
