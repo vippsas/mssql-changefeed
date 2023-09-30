@@ -328,11 +328,6 @@ returns nvarchar(max) as begin
     -- noone will use names like this.
     declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
 
-    declare @state_table nvarchar(max) = concat(
-            quotename(@changefeed_schema),
-            '.',
-            quotename(concat('state:', @unquoted_qualified_table_name)))
-
     declare @feed_table nvarchar(max) = concat(
         quotename(@changefeed_schema),
         '.',
@@ -595,6 +590,90 @@ end
 
 go
 
+
+create or alter function [changefeed].sql_permissions_outbox_reader(
+    @object_id int,
+    @changefeed_schema nvarchar(max)
+) returns nvarchar(max)
+as begin
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @role nvarchar(max) = quotename(concat(@changefeed_schema, '.readers:', @unquoted_qualified_table_name));
+    declare @cert nvarchar(max) = quotename(concat(@changefeed_schema, '.cert.readers:', @unquoted_qualified_table_name));
+    declare @user nvarchar(max) = quotename(concat(@changefeed_schema, '.user.readers:', @unquoted_qualified_table_name));
+    declare @state_table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('state:', @unquoted_qualified_table_name)))
+    declare @read_feed_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('read_feed:', @unquoted_qualified_table_name)))
+
+
+    return concat(
+'
+-- 1) Use a certificate to essentially grant the read_feed: procedure write permissions, as itself, to the state table.
+-- This disallows changing the state table directly but allows using read_feed to change it..
+
+create certificate ', @cert, ' encryption by password = ''SqlCodePw1%'' with subject = ''"changefeed"'';
+add signature to ', @read_feed_proc, ' by certificate ', @cert, ' with password = ''SqlCodePw1%'';
+create user ', @user, ' from certificate ', @cert, ';
+
+grant select, insert, update on ', @state_table,' to ', @user, ';
+
+alter certificate ', @cert, ' remove private key; -- password no longer usable after this
+
+-- 2) Create a role that can execute read_feed
+
+create role ', @role, ';
+grant execute on ', @read_feed_proc, ' to ', @role, ';
+')
+
+end
+
+go
+
+create or alter function [changefeed].sql_permissions_writer(
+    @object_id int,
+    @changefeed_schema nvarchar(max),
+    @outbox bit
+) returns nvarchar(max)
+as begin
+    declare @unquoted_qualified_table_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+    declare @role nvarchar(max) = quotename(concat(@changefeed_schema, '.writers:', @unquoted_qualified_table_name));
+    declare @outbox_table nvarchar(max) = [changefeed].sql_outbox_table_name(@object_id, @changefeed_schema);
+    declare @state_table nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('state:', @unquoted_qualified_table_name)))
+    declare @lock_proc nvarchar(max) = concat(
+            quotename(@changefeed_schema),
+            '.',
+            quotename(concat('lock:', @unquoted_qualified_table_name)))
+    declare @sql nvarchar(max)
+
+    if @outbox = 1
+    begin
+        set @sql = concat('
+create role ', @role, ';
+grant insert on ', @outbox_table ,' to ', @role, ';
+');
+    end
+    else
+    begin
+        set @sql = concat('
+create role ', @role, ';
+grant select, insert, update on ', @state_table,' to ', @role, ';
+grant execute on ', @lock_proc, ' to ', @role, ';
+');
+    end
+    return @sql
+end
+
+go
+
 -- upgrade_feed is called if setup_feed has earlier been called to upgrade to a new version.
 -- right now this only supports to re-run all stored procedures as `create or alter`, allowing
 -- code updates in the stored procedures without affecting the tables created
@@ -695,6 +774,15 @@ as begin
 
     -- Stored procedures done by upgrade_feed...
     exec [changefeed].upgrade_feed @table_name, @outbox = @outbox, @blocking = @blocking;
+
+    if @outbox = 1
+    begin
+        set @sql = [changefeed].sql_permissions_outbox_reader(@object_id, @changefeed_schema);
+        exec sp_executesql @sql;
+    end
+
+    set @sql = [changefeed].sql_permissions_writer(@object_id, @changefeed_schema, @outbox);
+    exec sp_executesql @sql;
 end
 
 go
@@ -709,4 +797,6 @@ as begin
     end)
 end
 
+go
 
+grant execute on [changefeed].ulid to public;

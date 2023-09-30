@@ -28,7 +28,9 @@ func (s StdoutLogger) Println(v ...interface{}) {
 var _ mssql.Logger = StdoutLogger{}
 
 type Fixture struct {
-	DB *sql.DB
+	AdminDB    *sql.DB
+	UserDB     *sql.DB
+	ReadUserDB *sql.DB
 }
 
 var fixture = Fixture{}
@@ -45,7 +47,7 @@ func (f *Fixture) RunMigrations() {
 		parts := strings.Split(string(migrationSql), "\ngo\n")
 		lineno := 0
 		for _, p := range parts {
-			_, err = f.DB.Exec(p)
+			_, err = f.AdminDB.Exec(p)
 			if err != nil {
 				fmt.Println(p)
 				err2, ok := err.(mssql.Error)
@@ -87,7 +89,16 @@ func TestMain(m *testing.M) {
 	}
 	dbname := strings.ReplaceAll(uuid.Must(uuid.NewV4()).String(), "-", "")
 
-	_, err = adminDb.ExecContext(ctx, fmt.Sprintf(`create database [%s]`, dbname))
+	_, err = adminDb.ExecContext(ctx, `sp_configure 'contained database authentication', 1; `)
+	if err != nil {
+		panic(err)
+	}
+	_, err = adminDb.ExecContext(ctx, `declare @sql nvarchar(max) = 'reconfigure'; exec sp_executesql @sql`)
+	if err != nil {
+		panic(err)
+	}
+
+	_, err = adminDb.ExecContext(ctx, fmt.Sprintf(`create database [%s] containment = partial`, dbname))
 	if err != nil {
 		panic(err)
 	}
@@ -105,7 +116,9 @@ func TestMain(m *testing.M) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		_ = fixture.DB.Close()
+		_ = fixture.AdminDB.Close()
+		_ = fixture.UserDB.Close()
+		_ = fixture.ReadUserDB.Close()
 		_, _ = adminDb.ExecContext(ctx, fmt.Sprintf(`drop database %s`, dbname))
 		_ = adminDb.Close()
 	}()
@@ -115,15 +128,30 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	pdsn.Database = dbname
+	fmt.Println(pdsn.URL().String())
 
-	fixture.DB, err = sql.Open("sqlserver", pdsn.URL().String())
+	fixture.AdminDB, err = sql.Open("sqlserver", pdsn.URL().String())
 	if err != nil {
 		panic(err)
 	}
 
 	fixture.RunMigrations()
 
-	err = fixture.DB.QueryRow(`select object_id('myservice.MyTable')`).Scan(&MyTableObjectID)
+	pdsn.User = "myuser"
+	pdsn.Password = "UserPw1234"
+	fixture.UserDB, err = sql.Open("sqlserver", pdsn.URL().String())
+	if err != nil {
+		panic(err)
+	}
+
+	err = fixture.UserDB.QueryRow(`select object_id('myservice.MyTable')`).Scan(&MyTableObjectID)
+	if err != nil {
+		panic(err)
+	}
+
+	pdsn.User = "myreaduser"
+	pdsn.Password = "UserPw1234"
+	fixture.ReadUserDB, err = sql.Open("sqlserver", pdsn.URL().String())
 	if err != nil {
 		panic(err)
 	}

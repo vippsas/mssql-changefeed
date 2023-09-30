@@ -9,12 +9,15 @@ import (
 	"testing"
 )
 
-func TestHappyDaySerializeWriters(t *testing.T) {
-	_, err := fixture.DB.ExecContext(context.Background(),
-		`exec [changefeed].setup_feed 'myservice.TestSerializeWriters', @serialize_writers=1`)
+func TestHappyDayBlocking(t *testing.T) {
+	_, err := fixture.AdminDB.ExecContext(context.Background(),
+		`
+exec [changefeed].setup_feed 'myservice.TestSerializeWriters', @blocking=1;
+alter role [changefeed.writers:myservice.TestSerializeWriters] add member myuser;
+`)
 	require.NoError(t, err)
 
-	_, err = fixture.DB.Exec(`
+	_, err = fixture.UserDB.Exec(`
 
 	begin transaction
 	
@@ -58,7 +61,7 @@ func TestHappyDaySerializeWriters(t *testing.T) {
 		EventID []byte
 	}
 
-	ulids, err := sqltest.StructSlice2[Row](context.Background(), fixture.DB, `select EventID from myservice.TestSerializeWriters order by Data`)
+	ulids, err := sqltest.StructSlice2[Row](context.Background(), fixture.AdminDB, `select EventID from myservice.TestSerializeWriters order by Data`)
 	require.NoError(t, err)
 	assert.Equal(t, 5, len(ulids))
 

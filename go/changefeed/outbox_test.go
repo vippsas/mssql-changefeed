@@ -25,7 +25,7 @@ func TestDatabaseSetup(t *testing.T) {
 	defer cancel()
 
 	var dbname string
-	require.NoError(t, fixture.DB.QueryRowContext(ctx, `select db_name()`).Scan(&dbname))
+	require.NoError(t, fixture.AdminDB.QueryRowContext(ctx, `select db_name()`).Scan(&dbname))
 	assert.Equal(t, len("54b10c7d4ea54e538dd1c04bbe75d61c"), len(dbname))
 }
 
@@ -34,18 +34,21 @@ func TestIntegerConversionMssqlAndGo(t *testing.T) {
 	ctx := context.Background()
 
 	var minusOne int64
-	err := fixture.DB.QueryRowContext(ctx, `select convert(bigint, 0xffffffffffffffff)`).Scan(&minusOne)
+	err := fixture.AdminDB.QueryRowContext(ctx, `select convert(bigint, 0xffffffffffffffff)`).Scan(&minusOne)
 	require.NoError(t, err)
 
 	assert.Equal(t, "ffffffffffffffff", fmt.Sprintf("%x", uint64(minusOne)))
 }
 
 func TestHappyDayOutbox(t *testing.T) {
-	_, err := fixture.DB.ExecContext(context.Background(),
-		`exec [changefeed].setup_feed 'myservice.TestHappyDay'`)
+	_, err := fixture.AdminDB.ExecContext(context.Background(), `
+exec [changefeed].setup_feed 'myservice.TestHappyDay', @outbox = 1;
+alter role [changefeed.writers:myservice.TestHappyDay] add member myuser;
+alter role [changefeed.readers:myservice.TestHappyDay] add member myreaduser;
+`)
 	require.NoError(t, err)
 
-	_, err = fixture.DB.ExecContext(context.Background(), `
+	_, err = fixture.UserDB.ExecContext(context.Background(), `
 insert into myservice.TestHappyDay (AggregateID, Version, Data) values 
 	(1000, 1, '1000-1'),
 	(1000, 2, '1000-2'),
@@ -64,7 +67,7 @@ insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, A
 	require.NoError(t, err)
 
 	// First consume head of feed while checking that paging works
-	page1 := sqltest.Query(fixture.DB, `
+	page1 := sqltest.Query(fixture.ReadUserDB, `
 	create table #read (
 		ulid binary(16) not null,
 		AggregateID bigint not null,
@@ -88,7 +91,7 @@ insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, A
 	assert.Equal(t, "2023-05-31T12:03:00Z", hexUlidToTime(page1[1][0].(string)))
 	assert.Equal(t, "2023-05-31T12:03:00Z", hexUlidToTime(page1[2][0].(string)))
 
-	page2 := sqltest.Query(fixture.DB, `
+	page2 := sqltest.Query(fixture.ReadUserDB, `
 	create table #read (
 		ulid binary(16) not null,
 		AggregateID bigint not null,
@@ -105,11 +108,11 @@ insert into [changefeed].[outbox:myservice.TestHappyDay] (shard_id, time_hint, A
 	assert.Equal(t, "2023-05-31T12:10:00Z", hexUlidToTime(page2[1][0].(string)))
 
 	// Check that table sizes are what we expect
-	assert.Equal(t, 0, sqltest.QueryInt(fixture.DB, `select count(*) from [changefeed].[outbox:myservice.TestHappyDay]`))
-	assert.Equal(t, 5, sqltest.QueryInt(fixture.DB, `select count(*) from [changefeed].[feed:myservice.TestHappyDay]`))
+	assert.Equal(t, 0, sqltest.QueryInt(fixture.AdminDB, `select count(*) from [changefeed].[outbox:myservice.TestHappyDay]`))
+	assert.Equal(t, 5, sqltest.QueryInt(fixture.AdminDB, `select count(*) from [changefeed].[feed:myservice.TestHappyDay]`))
 
 	// Do a re-read of feed from start, skipping the ULIDs to get predictable data for assertion
-	allEvents := sqltest.Query(fixture.DB, `
+	allEvents := sqltest.Query(fixture.ReadUserDB, `
 	create table #read (
 		ulid binary(16) not null,
 		AggregateID bigint not null,

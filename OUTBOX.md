@@ -11,8 +11,8 @@ passing in the name of a table and `@outbox = 1`, in one of your own
 migration files.
 ```sql
 exec changefeed.setup_feed @table = 'myservice.MyEvent', @outbox = 1;
-alter role changefeed.[writers:myservice.MyEvent] add member service1;
-alter role changefeed.[readers:myservice.MyEvent] add member service2;
+alter role [changefeed.writers:myservice.MyEvent] add member service1;
+alter role [changefeed.readers:myservice.MyEvent] add member service2;
 ```
 
 This stored procedure will generate tables and stored procedures tailored
