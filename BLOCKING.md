@@ -1,85 +1,44 @@
 # mssql-changefeed: User guide for blocking mode
-## Usage
 
-### Feed setup
+Please see [README](README.md) for an overview of the mssql-changefeed
+library, and a comparison of the *blocking mode* documented below with
+the [outbox mode](OUTBOX.md).
 
-You set up a new feed by calling a stored procedure,
-passing in the name of a table, in one of your own
+## Setup migration
+
+You set up a new feed by calling the `setup_feed` stored procedure,
+passing in the name of a table and `@blocking = 1`, in one of your own
 migration files.
 ```sql
-exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @outbox = 1;
-alter role [changefeed].[role:myservice.MyEvent] add member myservice_user;    
+exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @blocking = 1;
+alter role [changefeed].[writers:myservice.MyEvent] add member service1;    
 ```
 
-For the outbox pattern, pass `@outbox = 1` like above, while for the serialized writers mode
-pass `@serialize_writers = 1`.
+This stored procedure will generate tables and stored procedures tailored
+for your table and allow the `service1` user to publish new events.
 
-Calling this stored procedure will generate tables
-and stored procedures tailored for your table; in particular
-the primary keys of the table is embedded.
+Unlike the outbox mode, there is no special support for readers; this is
+for you to provide through your table design.
 
-### Outbox pattern
+## About shard_id
 
-* Pro: Writers are not blocked
-* Con: Generated ULIDs not available at the time of write
+Below there is a `shard_id` parameter. This can be set to any `int` number.
+The usage of a new `shard_id` effectively creates an independent
+event feed.
 
-Call `setup_feed` using `@outbox=1`, as in the example above.
+If you do not have very high volumes, simply hard-code `shard_id` to 0 everywhere.
 
-Whenever you insert into your main event table, you must make
-sure to always also insert into an *outbox table*:
-```sql
--- the event table looks however you want; in this example,
--- the primary key is (AggregateID, Version)
-insert into myservice.MyEvent (AggregateID, Version, ChosenShoeSize)
-    values (1000, 1, 38);
+For the blocking mode, the number of partitions needed should be primarily
+be affected by how many partitions it is appropriate for consumers to have;
+but it could also be used to reduce the time writers are blocked on waiting
+for one another on the same partition on average. This wait time should be
+a small problem, unless you are using transactions that take a lot of time
+to complete.
 
--- Also always insert into the outbox. The last columns
--- are the primary key of your table
-insert into [changefeed].[outbox:myservice.MyEvent] (shard_id, time_hint, AggregateID, Version)
-values (1000 % 2, '2023-05-31 12:00:00', 1000, 1);
-```
-You can do this extra insert either in the backend code, or by using a trigger in SQL
-(that you provide). Make sure both inserts happen in the same database
-transaction!
+## Publisher code
 
-Now, the ULIDs which determines the final ordering of the event
-on the feed is actually not generated yet. This is generated *the first*
-time the feed is read; and to organize this, all readers need to consume
-the feed by calling a stored procedure. Example read:
-```sql
-create table #read (
-    -- always here:
-    ulid binary(16) not null,
-    -- primary keys of your particular table:
-	AggregateID bigint not null,
-	Version int not null	    
-);
-exec [changefeed].[read_feed:myservice.MyEvent] @shard, @cursor, @pagesize
-select * from #read as r
-join myservice.MyEvent as e
-    on r.AggregateID = e.AggregateID and r.Version = e.Version 
-order by ulid;
-```
-To consume the feed, the maximum `ulid` returned should be stored and used as `@cursor` in the next
-iteration. The `changefeed.read_feed:*` procedure will first attempt
-to read from `changefeed.feed:*`. If there are no new entries, it will process the
-`changefeed.outbox:*` table, assign ULIDs, and both write the rows
-to `changefeed.feed:*` for future lookups as well as returning them.
-
-You should not insert into `changefeed.feed:*` directly, unless if you are
-backfilling old data. Such data inserted manually into the feed will not be
-seen by currently active consumers reading from the head of the feed. Never
-insert near the head of `changefeed.feed:*` as you risk triggering race conditions.
-
-### Serializing writers
-
-* Pro: Generated ULIDs available at time of write / before commit
-* Con: Writers are serialized (within their allocated `shard_id`)
-* Con: If you have client-managed transactions, you run the risk of
-  [blocking all writes for 60 seconds](POWEROFF.md).
-
-In this method, we generate the ULIDs *before* they are needed
-and simply write them as ordinary data. This means you will have some table
+The idea is to generate the ULID for your event before you write
+the event. So, for instance you may have a table 
 similar to this:
 ```sql
 create table myservice.MyEvent(
@@ -91,17 +50,8 @@ create table myservice.MyEvent(
 ) with (data_compression = page);
 ```
 To support reading from the feed you should make available a unique
-index on `(Shard, ULID)`, in this case we make it the primary key of our table.
-
-Then when setting up the feed you
-want to use the `@serialize_writers=1` option instead:
-
-```sql
-exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @serialize_writers = 1;
-```
-(The state table is under the hood the same, so it would be possible in the future to develop
-some compatability so that *both* approaches can be used at the same time,
-if needed.)
+index on `(Shard, ULID)`. In this case we make it the primary key of our table,
+but it could also be a secondary key.
 
 To avoid the [power-off issue](POWEROFF.md) we use a server-side transaction
 inside the SQL batch in our example:
@@ -119,9 +69,7 @@ begin try
     
     -- Proceed with inserting, generating ULIDs in the right order
     insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
-    select
-        changefeed.ulid(next value for changefeed.sequence over (order by i.Time))
-    from @inputtable as i;
+    values (0, changefeed.ulid(0), 1234, 42);
         
     commit
 
@@ -132,21 +80,67 @@ begin catch
 end catch
 ```
 
-The call to `lock_feed:*` takes a lock so that other writers to the same
-shard will stop at that location (serializing writers). After this call,
-it is possible to call `changefeed.ulid(next value for changefeed.sequence)`.
-All the ULIDs generated in the same database transaction will have the same
-timestamp.
+The call to `lock:*` takes a lock so that other writers to the same
+shard will block and wait. After this call, it is possible to call
+`changefeed.ulid(@i)`.
 
-In the example above, the `over` clause is used on `next value for` t
-to generate a single ULID, or use `changefeed.ulid(next value for changefeed.sequence over (order by ...))`
-to generate a large number of UILD
+The parameter `@i` is used to insert several events in the same
+transaction. If you only insert a single event, simply pass `0`;
+but if you are inserting many you can for instance use `row_number`
+to generate a large number of ULIDs:
+```sql
+insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
+select
+    i.UserID % 4,
+    changefeed.ulid(row_number() over (order by i.UserID)),
+    i.UserID,
+    i.ChosenShoeSize
+from @input as i
+```
+If you happen to have a 2nd statement in the same database transaction
+that needs ULIDs, simply add a large, safe constant like 1000000:
+```sql
+-- Insert the rows from @secondinput; we assume that there was less than 1000000
+-- rows in @input...
+insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
+select
+    i.UserID % 4,
+    -- 
+    changefeed.ulid(row_number() over (order by i.UserID) + 1000000),
+    i.UserID,
+    i.ChosenShoeSize
+from @secondinput as i
+```
+Calling `lock:*` allocates 100000000000 (10^11) ULIDs under the hood,
+so your constants should stay safely within this range.
 
-which generates any number of ULIDs. See reference for more
-details.
+Alternatively, you may also call `lock:*` a 2nd time.
 
+To protect yourself from bugs, `changefeed.ulid()` will generate an
+error if `lock:*` has not been called first.
 
+## Consumer code
 
+Consumers simply executes queries on the ULID generated by the publisher.
+Continuing on the example above:
+```sql
+declare @cursor binary(16) = (select MaxReadULID from MyStateTable where Shard = 0);
+
+insert into @pageOfData
+select top(1000) * from myservice.MyEvent
+where ULID > @Cursor and Shard = 0
+order by ULID;
+
+begin transaction 
+   -- process the @pageOfData
+
+   -- also update the state table in the same transaction:
+   update MyStateTable
+   set MaxReadULID = (select max(ULID) from @pageOfData)
+   where Shard = 0;
+
+commit
+```
 
 ## Still curious?
 

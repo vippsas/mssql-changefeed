@@ -1,7 +1,7 @@
 # mssql-changefeed: User guide for outbox mode
 
 Please see [README](README.md) for an overview of the mssql-changefeed
-library, and a comparison of the outbox mode documented below with
+library, and a comparison of the *outbox mode* documented below with
 the [blocking mode](BLOCKING.md).
 
 ## Setup migration

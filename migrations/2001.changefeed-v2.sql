@@ -601,14 +601,14 @@ go
 create or alter procedure [changefeed].upgrade_feed(
     @table_name nvarchar(max),
     @outbox bit = 0,
-    @serialize_writers bit = 0
+    @blocking bit = 0
 )
 as begin
     declare @object_id int = object_id(@table_name, 'U');
     if @object_id is null throw 71000, 'Could not find @table_name', 0;
 
-    if @outbox = 0 and @serialize_writers = 0
-        throw 55000, '[changefeed].setup_feed: please pass either @outbox=1 or @serialize_writers=1', 1;
+    if (@outbox = 0 and @blocking = 0) or (@outbox = 1 and @blocking = 1)
+        throw 55000, '[changefeed].setup_feed: please pass *either* @outbox=1 *or* @blocking=1', 1;
 
     -- in order to be able to search/replace [changefeed] in this script, this is bit weird:
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
@@ -637,7 +637,7 @@ as begin
         exec sp_executesql @sql;
     end
 
-    if @serialize_writers = 1
+    if @blocking = 1
     begin
         set @sql = [changefeed].sql_create_lock_procedure(@object_id, @changefeed_schema);
         exec sp_executesql @sql;
@@ -650,14 +650,14 @@ go
 create or alter procedure [changefeed].setup_feed(
     @table_name nvarchar(max),
     @outbox bit = 0,
-    @serialize_writers bit = 0
+    @blocking bit = 0
 )
 as begin
     declare @object_id int = object_id(@table_name, 'U');
     if @object_id is null throw 71000, 'Could not find @table_name', 0;
 
-    if @outbox = 0 and @serialize_writers = 0
-        throw 55000, '[changefeed].setup_feed: please pass either @outbox=1 or @serialize_writers=1', 1;
+    if (@outbox = 0 and @blocking = 0) or (@outbox = 1 and @blocking = 1)
+        throw 55000, '[changefeed].setup_feed: please pass *either* @outbox=1 *or* @blocking=1', 1;
 
     -- in order to be able to search/replace [changefeed] in this script, this is bit weird:
     declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
@@ -694,7 +694,7 @@ as begin
     end
 
     -- Stored procedures done by upgrade_feed...
-    exec [changefeed].upgrade_feed @table_name, @outbox = @outbox, @serialize_writers = @serialize_writers;
+    exec [changefeed].upgrade_feed @table_name, @outbox = @outbox, @blocking = @blocking;
 end
 
 go
