@@ -10,7 +10,7 @@ You set up a new feed by calling the `setup_feed` stored procedure,
 passing in the name of a table and `@blocking = 1`, in one of your own
 migration files.
 ```sql
-exec [changefeed].setup_feed @table = 'myservice.MyEvent', @shard_key_type = 'uniqueidentifier', @blocking = 1;
+exec [changefeed].setup_feed @table = 'myservice.MyEvent', @blocking = 1;
 alter role [changefeed].[writers:myservice.MyEvent] add member service1;    
 ```
 
