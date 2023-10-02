@@ -73,7 +73,7 @@ We have gone through *many* iterations of possible patterns to do race-safe, Kaf
 event processing on SQL tables. In the end there wasn't a single winner and we provide two
 different mode. For most needs, *both* methods will do the job nicely.
 
-* [Blocking mode](Bl.md):
+* [Blocking mode](BLOCKING.md):
   * The idea is to serialize writers (for each partition) using traditional `update` locking
     * Scaling up throughput requires increasing number of partitions
   * This is the "least intrusive" method, simplest to understand and use
