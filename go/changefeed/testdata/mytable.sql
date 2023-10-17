@@ -17,6 +17,13 @@ create table myservice.TestHappyDay (
     primary key (AggregateID, Version)
 );
 
+create table myservice.TestLoadOutbox (
+    AggregateID bigint not null,
+    Version int not null,
+    Data varchar(max) not null,
+    primary key (AggregateID, Version)
+);
+
 create table myservice.MyTable (
     MyAggregateID bigint not null,
     Version int not null,
