@@ -366,6 +366,7 @@ as begin
 
         delete from #read;
 
+        -- Fast path if you are not on the head, do a 1st attempt without locks.
         insert into #read(ulid, ', @pklist,')
         select top(@pagesize)
             ulid,
@@ -373,7 +374,8 @@ as begin
         from ', @feed_table, '
         where
             shard_id = @shard_id
-            and ulid > @cursor;
+            and ulid > @cursor
+        order by ulid;
 
         if @@rowcount <> 0
         begin
@@ -381,7 +383,8 @@ as begin
         end
 
         -- Read to the current end of the feed; check the Outbox. If we read something
-        -- we put it into the log, so enter transaction.
+        -- we put it into the log, so enter transaction and get a lock.
+        set transaction isolation level read committed;
         begin transaction
 
         -- Use an application lock to make sure only one session will
@@ -395,30 +398,33 @@ as begin
             @shard_id = @shard_id,
             @lock_timeout = -1,
             @lock_result = @lock_result output;
-        if @lock_result = 1
-        begin
-            rollback
-            -- 1 means "got lock after timeout". This means someone else has processed the outbox;
-            -- so we try again once. If there are no results here, it just means the outbox was empty
-            -- just now anyway .. the caller should sleep a bit before retrying.
-
-            insert into #read(ulid, ', @pklist,')
-            select top(@pagesize)
-                ulid,
-                ', @pklist, '
-            from ', @feed_table, '
-            where
-                shard_id = @shard_id
-                and ulid > @cursor;
-            return
-        end;
 
         if @lock_result < 0
         begin
             throw 77100, ''Error getting lock'', 1;
         end;
 
-        -- @lock_result = 0; got lock without waiting. Consume outbox.
+        -- At this point it does not matter if we got the lock without waiting or not, in BOTH
+        -- cases it could be the case that new data is now available in the feed at some point
+        -- after our initila `select` above. So, we need to re-do the select while holding the
+        -- lock to ensure we really are at the head.
+
+        insert into #read(ulid, ', @pklist,')
+        select top(@pagesize)
+            ulid,
+            ', @pklist, '
+        from ', @feed_table, '
+        where
+            shard_id = @shard_id
+            and ulid > @cursor
+        order by ulid;
+
+        if @@rowcount > 0
+        begin
+            -- OK we raced another process that processed the outbox, so return the page that process processed
+            rollback
+            return
+        end;
 
         declare @takenFromOutbox as table (
             order_sequence bigint not null primary key,
@@ -505,6 +511,12 @@ as begin
             ulid_high = iif(
                 -- embed max(time_hint, @previous_time) in ulid_high
                 @previous_time is null or taken.time_hint > @previous_time,
+
+                -- We do not use @next_ulid_high; because that will be based on max(time_hint).
+                -- Instead we wish to use the actual time_hint; those are safe to use since:
+                -- a) We patch them above to be in the order of order_sequence.
+                -- b) We only do this if they are larger than @previous_time; otherwise we use the previous
+                --    counter values..
                 convert(binary(6), datediff_big(millisecond, ''1970-01-01 00:00:00'', taken.time_hint)),
                 @previous_ulid_high),
             ulid_low = iif(
