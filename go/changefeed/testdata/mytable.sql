@@ -24,6 +24,13 @@ create table myservice.TestLoadOutbox (
     primary key (AggregateID, Version)
 );
 
+create table myservice.TestLoadBlocking (
+    ULID binary(16) not null,
+    Thread bigint not null,
+    Number bigint not null,
+    primary key (ULID)
+);
+
 create table myservice.MyTable (
     MyAggregateID bigint not null,
     Version int not null,
