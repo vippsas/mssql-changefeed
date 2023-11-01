@@ -437,6 +437,7 @@ as begin
 
         with totake as (
             select top(@pagesize) * from ', @outbox_table, ' as outbox
+            where outbox.shard_id = @shard_id
             order by outbox.order_sequence
         )
         delete top(@pagesize) from totake
