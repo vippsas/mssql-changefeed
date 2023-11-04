@@ -151,11 +151,12 @@ as begin
 
     declare @pkname nvarchar(max) = quotename(concat('pk:outbox:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
     declare @seq_constraint_name nvarchar(max) = quotename(concat('def:outbox.order_sequence:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
+    declare @shard_constraint_name nvarchar(max) = quotename(concat('def:outbox.shard_id:', [changefeed].sql_unquoted_qualified_table_name(@object_id)))
     return concat('
 create sequence ', @sequence,' as bigint start with 1 increment by 1 cache 100000;
 
 create table ', @table, '(
-    shard_id int not null,
+    shard_id int not null constraint ', @shard_constraint_name, ' default 0,
     order_sequence bigint constraint ', @seq_constraint_name,' default (next value for ', @sequence, '),
     time_hint datetime2(3) not null,
 ', [changefeed].sql_primary_key_column_declarations(@object_id, '    '), ',
@@ -564,7 +565,7 @@ create or alter function [changefeed].sql_create_lock_procedure(
             quotename(concat('update_state:', @unquoted_qualified_table_name)))
 
     return concat('create or alter procedure ', @lock_proc, '(
-    @shard_id int,
+    @shard_id int = 0,
     @time_hint datetime2(3) = null
 ) as begin
     set xact_abort, nocount on;

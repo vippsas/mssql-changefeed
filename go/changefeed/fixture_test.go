@@ -4,14 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	mssql "github.com/denisenkom/go-mssqldb"
-	"github.com/denisenkom/go-mssqldb/msdsn"
-	"github.com/gofrs/uuid"
 	"io/ioutil"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	mssql "github.com/denisenkom/go-mssqldb"
+	"github.com/denisenkom/go-mssqldb/msdsn"
+	"github.com/gofrs/uuid"
 )
 
 type StdoutLogger struct {
@@ -73,7 +74,7 @@ func TestMain(m *testing.M) {
 
 	dsn := os.Getenv("SQLSERVER_DSN")
 	if dsn == "" {
-		dsn = "sqlserver://localhost?database=master&user id=sa&password=VippsPw1"
+		dsn = "sqlserver://localhost?database=master&user id=sa&password=RootPw1"
 		//panic("Must set SQLSERVER_DSN to run tests")
 	}
 	dsn = dsn + "&log=3"
