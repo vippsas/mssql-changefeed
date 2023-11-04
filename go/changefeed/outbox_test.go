@@ -5,21 +5,18 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"sync"
+	"testing"
+	"time"
+
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
-	"sync"
-	"testing"
-	"time"
 
 	_ "github.com/denisenkom/go-mssqldb"
 )
-
-func discardResult(r sql.Result, err error) error {
-	return err
-}
 
 // Simply test that we can connect to a configured test database
 func TestDatabaseSetup(t *testing.T) {
