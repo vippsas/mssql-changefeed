@@ -11,7 +11,7 @@ passing in the name of a table and `@blocking = 1`, in one of your own
 migration files.
 ```sql
 exec [changefeed].setup_feed @table = 'myservice.MyEvent', @blocking = 1;
-alter role [changefeed].[writers:myservice.MyEvent] add member service1;    
+alter role [changefeed.writers:myservice.MyEvent] add member service1;    
 ```
 
 This stored procedure will generate tables and stored procedures tailored
