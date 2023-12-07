@@ -3,9 +3,10 @@ package changefeed
 import (
 	"context"
 	"fmt"
+	"testing"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestCreateStateTable(t *testing.T) {
@@ -76,8 +77,8 @@ func TestCreateLockProcedure(t *testing.T) {
 	require.NoError(t, fixture.AdminDB.QueryRow(`select [changefeed].sql_create_lock_procedure(object_id('myservice.MultiPK'), 'changefeed')`).Scan(&sql))
 	fmt.Println(sql)
 	// Simply check that generated SQL compiles
-	//_, err := fixture.AdminDB.ExecContext(context.Background(), sql)
-	//require.NoError(t, err)
+	_, err := fixture.AdminDB.ExecContext(context.Background(), sql)
+	require.NoError(t, err)
 }
 
 func TestRoleOutboxReader(t *testing.T) {
