@@ -11,7 +11,7 @@ passing in the name of a table and `@blocking = 1`, in one of your own
 migration files.
 ```sql
 
-exec [changefeed].setup_feed 'myservice.MyEvent', @blocking = 1;
+exec [changefeed].setup_feed @table_name = 'myservice.MyEvent', @blocking = 1;
 alter role [changefeed.writers:myservice.MyEvent] add member service1;    
 ```
 
