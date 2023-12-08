@@ -10,7 +10,8 @@ You set up a new feed by calling the `setup_feed` stored procedure,
 passing in the name of a table and `@blocking = 1`, in one of your own
 migration files.
 ```sql
-exec [changefeed].setup_feed @table_name = 'myservice.MyEvent', @blocking = 1;
+
+exec [changefeed].setup_feed 'myservice.MyEvent', @blocking = 1;
 alter role [changefeed.writers:myservice.MyEvent] add member service1;    
 ```
 
@@ -53,6 +54,7 @@ To support reading from the feed you should make available a unique
 index on `(Shard, ULID)`. In this case we make it the primary key of our table,
 but it could also be a secondary key.
 
+### Single ULID
 To avoid the [power-off issue](POWEROFF.md) we use a server-side transaction
 inside the SQL batch in our example:
 ```sql
@@ -64,12 +66,13 @@ begin try
     
     begin transaction
 
-    -- The first thing we do in our transaction is lock our shard for writes by us.
-    exec changefeed.[lock:myservice.MyEvent] @shard_id = 0;
+    -- Call a stored procedure to generate a ULID
+    declare @ulid binary(16)
+    exec changefeed.[lock:myservice.MyEvent] @shard_id = 0, @ulid = @ulid output;
     
     -- Proceed with inserting, generating ULIDs in the right order
     insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
-    values (0, changefeed.ulid(0), 1234, 42);
+    values (0, @ulid, 1234, 42);
         
     commit
 
@@ -81,43 +84,61 @@ end catch
 ```
 
 The call to `lock:*` takes a lock so that other writers to the same
-shard will block and wait. After this call, it is possible to call
-`changefeed.ulid(@i)`.
+shard will block and wait. It also returns a single generated ULID.
 
-The parameter `@i` is used to insert several events in the same
-transaction. If you only insert a single event, simply pass `0`;
-but if you are inserting many you can for instance use `row_number`
-to generate a large number of ULIDs:
+## Multiple ULIDs
+
+### Using the ulid() function
+It is possible to generate more ULIDs (millions). So the above could
+also look like this (skipping the transaction boiler plate). There is a
+function `changefeed.[ulid:myservice.MyEvent]` which takes a single integer
+argument; by passing it 1, 2, and so on you can generate new ULIDs.
+For instance:
 ```sql
+declare @ulid binary(16)
+exec changefeed.[lock:myservice.MyEvent] @shard_id = 0, @ulid = @ulid output;
+    
+-- Proceed with inserting, generating ULIDs in the right order
 insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
-select
-    i.UserID % 4,
-    changefeed.ulid(row_number() over (order by i.UserID)),
-    i.UserID,
-    i.ChosenShoeSize
-from @input as i
-```
-If you happen to have a 2nd statement in the same database transaction
-that needs ULIDs, simply add a large, safe constant like 1000000:
-```sql
--- Insert the rows from @secondinput; we assume that there was less than 1000000
--- rows in @input...
-insert into myservice.MyEvent (Shard, ULID, UserID, ChosenShoeSize)
-select
-    i.UserID % 4,
-    -- 
-    changefeed.ulid(row_number() over (order by i.UserID) + 1000000),
-    i.UserID,
-    i.ChosenShoeSize
-from @secondinput as i
+select 
+    0,
+    changefeed.[ulid:myservice.MyEvent](row_number() over (order by myinput.Time),
+    myinput.UserID,
+    myinput.ChosenShoeSize
+from myinput;
 ```
 Calling `lock:*` allocates 100000000000 (10^11) ULIDs under the hood,
-so your constants should stay safely within this range.
+so your argument to the function should stay lower than this.
 
-Alternatively, you may also call `lock:*` a 2nd time.
+If you happen to have a 2nd statement in the same database transaction
+that needs ULIDs, there are two ways to do that.
+Either you can call `[lock:*]` again, to allocate a new range.
+Or, simply add a large safe constant, like this:
 
-To protect yourself from bugs, `changefeed.ulid()` will generate an
-error if `lock:*` has not been called first.
+```sql
+select ...
+    changefeed.[ulid:myservice.MyEvent](row_number() over (order by i.UserID) + 1000000),
+...
+```
+
+### Low-level version
+The way the routine above works is by setting some state as a context variable.
+If you prefer to avoid that, you can do the exact same thing
+as above the low-level way like this:
+```sql
+declare @ulid_high binary(8)
+declare @ulid_low bigint
+exec changefeed.[lock:myservice.MyEvent] @shard_id = 0, @session_context = 0, @ulid_high = @ulid_high output, @ulid_low = @ulid_low output;
+```
+The `@session_context` argument is not really needed, just in case you wish
+to keep the context clean.
+The two components can be combined into a ULID like this:
+```sql
+@ulid_high + convert(binary(8), @ulid_low)
+```
+Now it is possible to arbitrarily generate ULIDs any way you like by adding
+to the `@ulid_low` offset. As above, the number you add should stay below
+10^11. 
 
 ## Consumer code
 

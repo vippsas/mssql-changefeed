@@ -5,12 +5,13 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"sync"
+	"testing"
+
 	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
-	"sync"
-	"testing"
 )
 
 func TestHappyDayBlocking(t *testing.T) {
@@ -32,30 +33,51 @@ alter role [changefeed.writers:myservice.TestSerializeWriters] add member myuser
 	
 	insert into myservice.TestSerializeWriters(EventID, Data)
 	values
-	    ([changefeed].ulid(0), 'a'),
-	 	([changefeed].ulid(1), 'b');
+	    ([changefeed].[ulid:myservice.TestSerializeWriters](0), 'a'),
+	 	([changefeed].[ulid:myservice.TestSerializeWriters](1), 'b');
 	
 	-- this will cause update in state table
 	exec [changefeed].[lock:myservice.TestSerializeWriters] @shard_id = 0, @time_hint = @now
 
 	insert into myservice.TestSerializeWriters(EventID, Data)
 	values
-	    ([changefeed].ulid(0), 'c');
+	    ([changefeed].[ulid:myservice.TestSerializeWriters](0), 'c');
 	
 	-- to verify the update of state table
 	exec [changefeed].[lock:myservice.TestSerializeWriters] @shard_id = 0, @time_hint = @now
 
 	insert into myservice.TestSerializeWriters(EventID, Data)
 	values
-	     ([changefeed].ulid(0), 'd');
+	     ([changefeed].[ulid:myservice.TestSerializeWriters](0), 'd');
 	
 	-- new timestamp (default time)
 	exec [changefeed].[lock:myservice.TestSerializeWriters] @shard_id = 0
 
 	insert into myservice.TestSerializeWriters(EventID, Data)
 	values
-	     ([changefeed].ulid(0), 'e');
+	     ([changefeed].[ulid:myservice.TestSerializeWriters](0), 'e');
+	
+	commit
 
+`)
+	require.NoError(t, err)
+
+	// Test not using session state, in a new session
+	_, err = fixture.UserDB.Exec(`
+
+	begin transaction
+	
+	declare @ulid binary(16);
+	declare @ulid_high binary(8);
+	declare @ulid_low bigint;
+	exec [changefeed].[lock:myservice.TestSerializeWriters] @shard_id = 0, @session_context = 0,
+		@ulid = @ulid output, @ulid_low = @ulid_low output, @ulid_high = @ulid_high output;
+	
+	insert into myservice.TestSerializeWriters(EventID, Data)
+	values
+	    (@ulid, 'f'),
+	    (@ulid_high + convert(binary(8), @ulid_low + 1), 'g');
+	
 	commit
 
 `)
@@ -67,7 +89,7 @@ alter role [changefeed.writers:myservice.TestSerializeWriters] add member myuser
 
 	ulids, err := sqltest.StructSlice2[Row](context.Background(), fixture.AdminDB, `select EventID from myservice.TestSerializeWriters order by Data`)
 	require.NoError(t, err)
-	assert.Equal(t, 5, len(ulids))
+	assert.Equal(t, 7, len(ulids))
 
 	ints := []uint64{}
 	for _, u := range ulids {
@@ -81,6 +103,11 @@ alter role [changefeed.writers:myservice.TestSerializeWriters] add member myuser
 	assert.Equal(t, ulids[0].EventID[:8], ulids[2].EventID[:8])
 	assert.Equal(t, ulids[0].EventID[:8], ulids[3].EventID[:8])
 	assert.Less(t, binary.BigEndian.Uint64(ulids[0].EventID[:8]), binary.BigEndian.Uint64(ulids[4].EventID[:8]))
+
+	// The 2nd session has ULIDs after the 1st one
+	assert.LessOrEqual(t, binary.BigEndian.Uint64(ulids[4].EventID[:8]), binary.BigEndian.Uint64(ulids[5].EventID[:8]))
+	// The 2 ULIDs from the last session follow each other
+	assert.Equal(t, ints[5]+1, ints[6])
 
 }
 
@@ -112,7 +139,7 @@ begin try
 		exec [changefeed].[lock:myservice.TestLoadBlocking] @shard_id = 0
 	
 		insert into myservice.TestLoadBlocking(ULID, Thread, Number)
-		values (changefeed.ulid(0), @p1, @p2);
+		values (changefeed.[ulid:myservice.TestLoadBlocking](0), @p1, @p2);
 	commit
 end try
 begin catch

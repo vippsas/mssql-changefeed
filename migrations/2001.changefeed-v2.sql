@@ -564,9 +564,17 @@ create or alter function [changefeed].sql_create_lock_procedure(
             '.',
             quotename(concat('update_state:', @unquoted_qualified_table_name)))
 
+    declare @session_var_transaction nvarchar(max) = concat('changefeed.transaction_id/', @unquoted_qualified_table_name);
+    declare @session_var_high nvarchar(max) = concat('changefeed.ulid_high/', @unquoted_qualified_table_name);
+    declare @session_var_low nvarchar(max) = concat('changefeed.ulid_low/', @unquoted_qualified_table_name);
+
     return concat('create or alter procedure ', @lock_proc, '(
     @shard_id int = 0,
-    @time_hint datetime2(3) = null
+    @time_hint datetime2(3) = null,
+    @session_context bit = 1,
+    @ulid_high binary(8) = null output,
+    @ulid_low bigint = null output,
+    @ulid binary(16) = null output
 ) as begin
     set xact_abort, nocount on;
     begin try
@@ -574,20 +582,31 @@ create or alter function [changefeed].sql_create_lock_procedure(
 
         if @time_hint is null set @time_hint = sysutcdatetime();
 
-        declare @next_ulid_high binary(8);
-        declare @next_ulid_low bigint;
-
         exec ', @update_state_proc, '
             @shard_id = @shard_id,
             @time_hint = @time_hint,
             @count = 100000000000,  -- 10^11
-            @next_ulid_high = @next_ulid_high output,
-            @next_ulid_low = @next_ulid_low output;
+            @next_ulid_high = @ulid_high output,
+            @next_ulid_low = @ulid_low output;
 
-        exec sp_set_session_context N''changefeed.ulid_high'', @next_ulid_high;
-        exec sp_set_session_context N''changefeed.ulid_low'', @next_ulid_low;
         declare @transaction_id bigint = current_transaction_id();
-        exec sp_set_session_context N''changefeed.transaction_id'', @transaction_id;
+
+        if @session_context = 1
+        begin
+            -- These are backwards-compatability for those using the ulid() convenience function available in some
+            -- earlier versions of mssql-changefeed. This might be removed at some point, but keeping it when
+            -- upgrading feeds now to get a smooth upgrade.
+            exec sp_set_session_context N''changefeed.transaction_id'', @transaction_id;
+            exec sp_set_session_context N''changefeed.ulid_high'', @ulid_high;
+            exec sp_set_session_context N''changefeed.ulid_low'', @ulid_low;
+
+            -- For use of [ulid:tablename]()
+            exec sp_set_session_context N''', @session_var_transaction, ''', @transaction_id;
+            exec sp_set_session_context N''', @session_var_high,''', @ulid_high;
+            exec sp_set_session_context N''', @session_var_low,''', @ulid_low;
+        end
+
+        set @ulid = @ulid_high + convert(binary(8), @ulid_low)
     end try
     begin catch
         if @@trancount > 0 rollback;
@@ -602,6 +621,32 @@ end
 
 go
 
+create or alter function [changefeed].sql_create_ulid_function(
+    @feed_name nvarchar(max),
+    @ulid_func_name nvarchar(max)
+)
+    returns nvarchar(max) as begin
+
+    declare @session_var_transaction nvarchar(max) = concat('changefeed.transaction_id/', @feed_name);
+    declare @session_var_high nvarchar(max) = concat('changefeed.ulid_high/', @feed_name);
+    declare @session_var_low nvarchar(max) = concat('changefeed.ulid_low/', @feed_name);
+
+    return concat('create or alter function ', @ulid_func_name, '(@i bigint) returns binary(16)
+as begin
+    return (case
+        -- protect against calling ulid(); it cannot raise error but make sure we return null
+        when isnull(try_convert(bigint, session_context(N''', @session_var_transaction,''')), 0) = current_transaction_id()
+            then convert(binary(8), session_context(N''', @session_var_high,''')) +
+             convert(binary(8), convert(bigint, session_context(N''', @session_var_low,''')) + @i)
+        else convert(binary(16), convert(int, ''error: changefeed.ulid must be called in a transaction, and after having called changefeed.lock:*''))
+    end)
+end
+')
+
+end
+
+
+go
 
 create or alter function [changefeed].sql_permissions_outbox_reader(
     @object_id int,
@@ -732,6 +777,20 @@ as begin
     begin
         set @sql = [changefeed].sql_create_lock_procedure(@object_id, @changefeed_schema);
         exec sp_executesql @sql;
+
+        declare @feed_name nvarchar(max) = [changefeed].sql_unquoted_qualified_table_name(@object_id)
+
+        declare @ulid_func_name nvarchar(max) = concat(
+                quotename(@changefeed_schema),
+                '.',
+                quotename(concat('ulid:', @feed_name)))
+
+        set @sql = [changefeed].sql_create_ulid_function(@feed_name, @ulid_func_name);
+        exec sp_executesql @sql;
+
+        set @sql = concat('grant execute on ', @ulid_func_name, ' to public;')
+        exec sp_executesql @sql;
+
     end
 
 end
@@ -796,19 +855,3 @@ as begin
     set @sql = [changefeed].sql_permissions_writer(@object_id, @changefeed_schema, @outbox);
     exec sp_executesql @sql;
 end
-
-go
-
-create or alter function [changefeed].ulid(@i bigint) returns binary(16)
-as begin
-    return (case
-        -- protect against calling ulid(); it cannot raise error but make sure we return null
-        when isnull(try_convert(bigint, session_context(N'changefeed.transaction_id')), 0) = current_transaction_id()
-            then convert(binary(8), session_context(N'changefeed.ulid_high')) + convert(binary(8), convert(bigint, session_context(N'changefeed.ulid_low')) + @i)
-        else convert(binary(16), convert(int, 'error: changefeed.ulid must be called in a transaction, and after having called changefeed.lock:*'))
-    end)
-end
-
-go
-
-grant execute on [changefeed].ulid to public;
