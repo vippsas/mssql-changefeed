@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  VERSIONNUMBER: 9.12.0
+  VERSIONNUMBER: 1.0.0
 
 jobs:
   Build-and-publish:
@@ -33,7 +33,7 @@ jobs:
         run: echo "BUILDNUMBER=$((($(date +%s) - $(date -d '2024-01-01' +%s)) / 3600 % 65535))" >> $GITHUB_ENV
 
       - name: Pack
-        run: dotnet pack --configuration Release /p:Version=${{ env.VERSIONNUMBER }}.${{ env.BUILDNUMBER }}
+        run: dotnet pack ./**/*.csproj --configuration Release /p:Version=${{ env.VERSIONNUMBER }}.${{ env.BUILDNUMBER }}
 
       - name: Push
         run: dotnet nuget push ./**/*.nupkg --skip-duplicate --source https://nuget.pkg.github.com/vippsas/index.json --api-key ${{ secrets.GITHUB_TOKEN }}
