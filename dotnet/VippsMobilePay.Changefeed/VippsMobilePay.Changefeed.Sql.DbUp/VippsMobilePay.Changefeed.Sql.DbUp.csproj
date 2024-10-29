@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Company>Vipps MobilePay</Company>
+        <Description>SqlDbUp extensions for changefeed</Description>
+        <Product>VippsMobilePay.Changefeed.Sql.DbUp</Product>
+        <PackageId>VippsMobilePay.Changefeed.Sql.DbUp</PackageId>
+        <PackageTags>changefeed;sql;dbup</PackageTags>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <AssemblyVersion>1.0.0</AssemblyVersion>
+        <Version>1.0.0</Version>
+        <RootNamespace>VippsMobilePay.Changefeed.Sql.DbUp</RootNamespace>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="dbup-sqlserver" Version="5.0.40" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <EmbeddedResource Include="../../../migrations/2001.changefeed-v2.sql" />
+    </ItemGroup>
+
+</Project>
