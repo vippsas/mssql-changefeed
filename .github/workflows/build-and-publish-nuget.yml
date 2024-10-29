@@ -1,0 +1,39 @@
+name: Build and publish NuGet
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+  packages: write
+
+env:
+  VERSIONNUMBER: 9.12.0
+
+jobs:
+  Build-and-publish:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET Core
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Add Vipps NuGet Source
+        run: dotnet nuget update source GitHub_Nuget --store-password-in-clear-text -u USERNAME -p ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate build number
+        id: buildnumber
+        run: echo "BUILDNUMBER=$((($(date +%s) - $(date -d '2024-01-01' +%s)) / 3600 % 65535))" >> $GITHUB_ENV
+
+      - name: Pack
+        run: dotnet pack --configuration Release /p:Version=${{ env.VERSIONNUMBER }}.${{ env.BUILDNUMBER }}
+
+      - name: Push
+        run: dotnet nuget push ./**/*.nupkg --skip-duplicate --source https://nuget.pkg.github.com/vippsas/index.json --api-key ${{ secrets.GITHUB_TOKEN }}

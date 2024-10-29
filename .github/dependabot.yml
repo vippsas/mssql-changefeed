@@ -1,0 +1,36 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "nuget" # See documentation for possible values
+    registries:
+      - vippsas-nuget
+      - nuget-org
+    directory: "/" # Location of package manifests
+    schedule:
+      interval: "daily"
+      time: "05:00"
+    open-pull-requests-limit: 5
+    groups:
+      dev-dependencies:
+        patterns:
+        - "*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      # Check for updates to GitHub Actions every week
+      interval: "weekly"
+
+registries:
+  vippsas-nuget:
+    type: nuget-feed
+    url: https://nuget.pkg.github.com/vippsas/index.json
+    username: USERNAME
+    password: ${{ secrets.READ_GITHUB_PACKAGES_PAT }}
+  nuget-org:
+    type: nuget-feed
+    url: https://api.nuget.org/v3/index.json
