@@ -1,3 +1,4 @@
+using System.Data;
 using AutoFixture.Xunit2;
 using Dapper;
 using Microsoft.Data.SqlClient;
@@ -76,7 +77,7 @@ public class Changefeed_Tests : IAsyncLifetime
 
         timestamp = DateTimeOffset.Now;
         await InsertIntoDatabaseInTransaction(new EventSourceDto{AggregateId = Guid.NewGuid(), Sequence = 0, Data = "3", Timestamp = timestamp}, _connection);
-        await InsertIntoDatabaseInTransaction(new EventSourceDto{AggregateId = Guid.NewGuid(), Sequence = 0, Data = "2", Timestamp = timestamp.AddSeconds(-1)}, _connection);
+        await InsertIntoDatabaseInTransaction(new EventSourceDto{AggregateId = Guid.NewGuid(), Sequence = 0, Data = "2", Timestamp = timestamp}, _connection);
         var secondPageResult = await ReadFeed(firstPageResult.Last().Ulid, 100, _connection);
         combinedReturnedEntries.AddRange(secondPageResult);
 
@@ -91,49 +92,58 @@ public class Changefeed_Tests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Back_Fill_OutBox()
+    public async Task Back_Fill_Feed()
     {
         // Existing events - before back fill and changefeed is started
-        var timestamp = DateTimeOffset.Now.AddDays(-1);
-        var oldEventSourceEntry1 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "0", Timestamp = timestamp };
-        var oldEventSourceEntry2 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "1", Timestamp = timestamp };
+        //var timestamp = DateTimeOffset.Now.AddDays(-1);
+        var oldEventSourceEntry1 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "0", Timestamp = DateTimeOffset.Now.AddDays(-2) };
+        var oldEventSourceEntry2 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 1, Data = "1", Timestamp = DateTimeOffset.Now.AddDays(-1) };
         await using var oldEventsTransaction = _connection.BeginTransaction();
         await InsertIntoEventSource(oldEventSourceEntry1, _connection, oldEventsTransaction);
         await InsertIntoEventSource(oldEventSourceEntry2, _connection, oldEventsTransaction);
         await oldEventsTransaction.CommitAsync();
 
-        // Starting to back fill outbox 
+        // Starting to back fill feed 
         await using var backFillTransaction = _connection.BeginTransaction();
-        await InsertIntoOutbox(oldEventSourceEntry1, _connection, backFillTransaction);
-        await InsertIntoOutbox(oldEventSourceEntry2, _connection, backFillTransaction);
+        await InsertIntoFeed(oldEventSourceEntry1, _connection, backFillTransaction);
+        await InsertIntoFeed(oldEventSourceEntry2, _connection, backFillTransaction);
         await backFillTransaction.CommitAsync();
         
         // Starting changefeed - Simulate live events at the same time as back filling is running
-        timestamp = DateTimeOffset.Now;
-        var liveEvent1 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "2", Timestamp = timestamp };
-        var liveEvent2 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "3", Timestamp = timestamp };
+        var timestamp = DateTimeOffset.Now;
+        var liveEvent1 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 2, Data = "2", Timestamp = timestamp };
+        var liveEvent2 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 3, Data = "3", Timestamp = timestamp };
         await InsertIntoDatabaseInTransaction(liveEvent1, _connection);
         await InsertIntoDatabaseInTransaction(liveEvent2, _connection);
 
         // Continue to back fill outbox after changefeed is started
         await using var continueBackFillTransaction = _connection.BeginTransaction();
-        await InsertIntoOutbox(liveEvent1, _connection, continueBackFillTransaction);
-        await InsertIntoOutbox(liveEvent2, _connection, continueBackFillTransaction);
+        await InsertIntoFeed(liveEvent1, _connection, continueBackFillTransaction);
+        await InsertIntoFeed(liveEvent2, _connection, continueBackFillTransaction);
         await continueBackFillTransaction.CommitAsync();
-
+        
         // Running changefeed - Back filling is stopped
         timestamp = DateTimeOffset.Now;
-        var liveEvent3 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "4", Timestamp = timestamp };
-        var liveEvent4 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 0, Data = "5", Timestamp = timestamp };
+        var liveEvent3 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 4, Data = "4", Timestamp = timestamp };
+        var liveEvent4 = new EventSourceDto { AggregateId = Guid.NewGuid(), Sequence = 5, Data = "5", Timestamp = timestamp };
         await InsertIntoDatabaseInTransaction(liveEvent3, _connection);
         await InsertIntoDatabaseInTransaction(liveEvent4, _connection);
         
         // First read determines the order, so wait until back filling is done and stopped 
         // There should be a small overlap on back filling and live events processing to ensure all
-        // events are added to the outbox
-        var result = await ReadFeed(_startCursor, 100, _connection);
+        // events are added to the outbox,
         
-        var feedResult = result.ToList();
+        // Note that the first page only contains the rows from the feed table. Only when the cursor is up to date
+        // with all rows in the feed table it will start to look into the outbox table. The feed and outbox output
+        // will not be combined in one read, but requires an additional read to get the last event from the outbox
+        var combinedReturnedEntries = new List<FeedResult>();
+        var firstPageResult = await ReadFeed(_startCursor, 100, _connection);
+        combinedReturnedEntries.AddRange(firstPageResult);
+
+        var secondPageResult = await ReadFeed(firstPageResult.Last().Ulid, 100, _connection);
+        combinedReturnedEntries.AddRange(secondPageResult);
+        
+        var feedResult = combinedReturnedEntries.ToList();
         Assert.Equal(6, feedResult.Count);
         Assert.Equal("0", feedResult[0].Data);
         Assert.Equal("1", feedResult[1].Data);
@@ -150,7 +160,7 @@ public class Changefeed_Tests : IAsyncLifetime
         await InsertIntoDatabaseInTransaction(eventSourceDto, _connection);
         
         await using var transaction = _connection.BeginTransaction();
-        await InsertIntoOutbox(eventSourceDto, _connection, transaction);
+        await InsertIntoFeed(eventSourceDto, _connection, transaction);
         await transaction.CommitAsync();
         
         var result = await ReadFeed(_startCursor, 10, _connection);
@@ -213,6 +223,57 @@ public class Changefeed_Tests : IAsyncLifetime
             transaction);
     }
     
+    private static async Task InsertIntoFeed(
+        EventSourceDto eventSourceDto,
+        SqlConnection connection,
+        SqlTransaction transaction)
+    {
+        const string insertIntoFeedStatement =
+            """
+            INSERT INTO [changefeed].[feed:dbo.EventSource] (shard_id, ulid, AggregateId, Sequence)
+            SELECT 0, @Ulid, @AggregateId, @Sequence
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM [changefeed].[feed:dbo.EventSource]
+                WHERE AggregateId = @AggregateId
+                AND Sequence = @Sequence
+            )
+            AND NOT EXISTS (
+                SELECT 1
+                FROM [changefeed].[outbox:dbo.EventSource]
+                WHERE AggregateId = @AggregateId
+                AND Sequence = @Sequence
+            );
+            """;
+        
+        var results = await connection.ExecuteAsync(
+            insertIntoFeedStatement,
+            new
+            {
+                Ulid = GenerateUlidBinary(eventSourceDto.Timestamp),
+                AggregateId = eventSourceDto.AggregateId,
+                Sequence = eventSourceDto.Sequence
+            },
+            transaction);
+    }
+    
+    public static byte[] GenerateUlidBinary(DateTimeOffset timestamp)
+    {
+        var ulid = Ulid.NewUlid();
+        var ulidBytes = ulid.ToByteArray();
+
+        var timestampMs = (long)(timestamp.UtcDateTime - DateTime.UnixEpoch).TotalMilliseconds;
+
+        ulidBytes[0] = (byte)((timestampMs >> 40) & 0xFF);
+        ulidBytes[1] = (byte)((timestampMs >> 32) & 0xFF);
+        ulidBytes[2] = (byte)((timestampMs >> 24) & 0xFF);
+        ulidBytes[3] = (byte)((timestampMs >> 16) & 0xFF);
+        ulidBytes[4] = (byte)((timestampMs >> 8) & 0xFF);
+        ulidBytes[5] = (byte)(timestampMs & 0xFF);
+
+        return ulidBytes;
+    }
+    
     private static async Task InsertIntoEventSource(
         EventSourceDto eventSourceDto,
         SqlConnection connection,
@@ -262,7 +323,9 @@ public class Changefeed_Tests : IAsyncLifetime
                 [ChangefeedAcceptanceTests].[dbo].[EventSource]
             INNER JOIN #read AS R ON
                 R.AggregateId = [ChangefeedAcceptanceTests].[dbo].[EventSource].AggregateId AND
-                R.Sequence = [ChangefeedAcceptanceTests].[dbo].[EventSource].Sequence;
+                R.Sequence = [ChangefeedAcceptanceTests].[dbo].[EventSource].Sequence
+            ORDER BY
+                ulid
             """;
 
         
@@ -275,5 +338,5 @@ public class Changefeed_Tests : IAsyncLifetime
             });
     
         return results;
-    }    
+    }
 }
