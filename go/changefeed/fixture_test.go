@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	mssql "github.com/denisenkom/go-mssqldb"
-	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/gofrs/uuid"
+	mssql "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
 )
 
 type StdoutLogger struct {
@@ -124,7 +124,7 @@ func TestMain(m *testing.M) {
 		_ = adminDb.Close()
 	}()
 
-	pdsn, _, err := msdsn.Parse(dsn)
+	pdsn, err := msdsn.Parse(dsn)
 	if err != nil {
 		panic(err)
 	}
