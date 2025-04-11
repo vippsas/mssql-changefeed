@@ -34,7 +34,13 @@ itself is in pure Microsoft SQL.
 To install it, execute the file [migrations/2001.changefeed-v2.sql](migrations/2001.changefeed-v2.sql)
 on your SQL server. This will create and populate the `changefeed` schema.
 
-Further usage depends on which of the two available modes you use, as described below.
+Further usage depends on which of the two available modes you use, as described below. 
+
+To clean up when a table doesn't need a changefeed anymore, or when a table has been / will be deleted, 
+you can run the following to remove all changefeed entities for a table:
+```sql
+exec [changefeed].teardown_feed @table_name = 'myservice.MyEvent';
+```
 
 ## Fundamental concept: Assign ULIDs to events in a race-safe manner.
 
@@ -105,4 +111,3 @@ still available on the [v1 branch](TODO). Compared to v2, it:
 * Requires a sweeper to run in the background, instead of moving
   between outbox and feed tables on access
 * Uses integer cursors instead of ULIDs
-
