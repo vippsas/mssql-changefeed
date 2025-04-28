@@ -22,7 +22,7 @@ jobs:
         run: dotnet nuget update source GitHub_Nuget --store-password-in-clear-text -u USERNAME -p ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
-        run: dotnet build --configuration Release
+        run: dotnet build --configuration Release ./dotnet/VippsMobilePay.Changefeed
 
       - name: Test
-        run: dotnet test --configuration Release
+        run: dotnet test --configuration Release ./dotnet/VippsMobilePay.Changefeed
