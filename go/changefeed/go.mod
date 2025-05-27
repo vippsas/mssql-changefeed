@@ -1,6 +1,6 @@
 module github.com/vippsas/mssql-changefeed/go/changefeed
 
-go 1.23.8
+go 1.24.3
 
 require (
 	github.com/alecthomas/repr v0.4.0
