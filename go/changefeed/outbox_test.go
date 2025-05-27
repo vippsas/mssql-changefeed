@@ -4,13 +4,13 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/oklog/ulid"
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vippsas/mssql-changefeed/go/changefeed/sqltest"
@@ -264,12 +264,12 @@ values (0, sysutcdatetime(), @p1, @p2);`, ithread, j)
 		// Once everything has been consumed, assert that all events are here and in order...
 		for i := 0; i != tc.writerCount; i++ {
 			if len(events[i]) != tc.eventCountPerThread {
-				readerErr = errors.Errorf("wrong count in events[i]")
+				readerErr = errors.New("wrong count in events[i]")
 				return
 			}
 			for j := 0; j != tc.eventCountPerThread; j++ {
 				if events[i][j] != j {
-					readerErr = errors.Errorf("events[i][j] != j")
+					readerErr = errors.New("events[i][j] != j")
 				}
 			}
 		}
