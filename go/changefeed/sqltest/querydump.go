@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -11,7 +12,6 @@ import (
 	"time"
 
 	"github.com/alecthomas/repr"
-	"github.com/pkg/errors"
 )
 
 type MapRow map[string]interface{}
@@ -26,7 +26,7 @@ func runQuery(dbi interface{}, qry string, args ...interface{}) *sql.Rows {
 	case CtxQuerier:
 		rows, err := q.QueryContext(context.Background(), qry, args...)
 		if err != nil {
-			panic(errors.WithStack(err))
+			panic(fmt.Sprintf("while running the query:%s with arguments:[%+v] faced the error: %s", qry, args, err))
 		}
 		return rows
 	default:
@@ -40,11 +40,11 @@ func RowIteratorToSlice(rows *sql.Rows) (columns []string, result Rows) {
 
 	columns, err := rows.Columns()
 	if err != nil {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in RowIteratorToSlice while trying to get columns faced the error: %s", err))
 	}
 	types, err := rows.ColumnTypes()
 	if err != nil || len(types) != len(columns) {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in RowIteratorToSlice while trying to get column's types faced the error: %s", err))
 	}
 	n := len(columns)
 	rowValues := make([]interface{}, n, n)
@@ -55,7 +55,7 @@ func RowIteratorToSlice(rows *sql.Rows) (columns []string, result Rows) {
 	for rows.Next() {
 		err = rows.Scan(pointers...)
 		if err != nil {
-			panic(errors.WithStack(err))
+			panic(fmt.Sprintf("in RowIteratorToSlice by calling the Next() faced the error: %s", err))
 		}
 
 		var row Row
@@ -135,28 +135,28 @@ func Query(dbi CtxQuerier, qry string, args ...interface{}) Rows {
 
 func QueryInt(dbi CtxQuerier, qry string, args ...interface{}) (result int) {
 	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in QueryInt while executing query: %s with arguments: [%+v] faced the error: %s", qry, args, err))
 	}
 	return
 }
 
 func QueryT[T any](dbi CtxQuerier, qry string, args ...interface{}) (result T) {
 	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in QueryT while executing query: %s with arguments: [%+v] faced the error: %s", qry, args, err))
 	}
 	return
 }
 
 func QueryString(dbi CtxQuerier, qry string, args ...interface{}) (result string) {
 	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in QueryT while executing query: %s with arguments: [%+v] faced the error: %s", qry, args, err))
 	}
 	return
 }
 
 func QueryTime(dbi CtxQuerier, qry string, args ...interface{}) (result time.Time) {
 	if err := dbi.QueryRowContext(context.Background(), qry, args...).Scan(&result); err != nil {
-		panic(errors.WithStack(err))
+		panic(fmt.Sprintf("in QueryTime while executing query: %s with arguments: [%+v] faced the error: %s", qry, args, err))
 	}
 	return
 }
@@ -182,21 +182,21 @@ func StructSlice2[T any](ctx context.Context, querier CtxQuerier, qry string, ar
 func Structs(ctx context.Context, querier CtxQuerier, pointerToStruct interface{}, next func() error, qry string, args ...interface{}) error {
 	// Avoid nil pointer errors and invalid API use
 	if querier == nil {
-		return errors.Errorf("querier cannot be nil")
+		return errors.New("querier cannot be nil")
 	}
 	if pointerToStruct == nil {
-		return errors.Errorf("pointerToStruct cannot be nil!")
+		return errors.New("pointerToStruct cannot be nil!")
 	}
 	if reflect.TypeOf(pointerToStruct).Kind() != reflect.Ptr {
-		return errors.Errorf("Expecting pointerToStruct to be a pointer to a struct, did you forget a '&'?")
+		return errors.New("Expecting pointerToStruct to be a pointer to a struct, did you forget a '&'?")
 	}
 	if reflect.ValueOf(pointerToStruct).IsNil() {
-		return errors.Errorf("pointerToStruct cannot be nil!")
+		return errors.New("pointerToStruct cannot be nil!")
 	}
 
 	rows, err := querier.QueryContext(ctx, qry, args...)
 	if err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("in Struct while executing the query: %s faced the error: %w", qry, err)
 	}
 
 	// Closing rows is critical to return db connection to pool
@@ -211,17 +211,17 @@ func Structs(ctx context.Context, querier CtxQuerier, pointerToStruct interface{
 	for rows.Next() {
 		// Scan a row into the reordered pointers
 		if err := rows.Scan(ptrs...); err != nil {
-			return errors.WithStack(err)
+			return fmt.Errorf("in Structs by calling Scan() faced the error: %w", err)
 		}
 		// Call next closure to tell our caller to consume the single struct value
 		if err := next(); err != nil {
-			return errors.WithStack(err)
+			return fmt.Errorf("in Structs by calling next closure faced the error: %w", err)
 		}
 	}
 
 	// This final error check is important, and easily forgotten
 	if err := rows.Err(); err != nil {
-		return errors.WithStack(err)
+		return fmt.Errorf("in Structs by checking the rows.Err() found the error: %w", err)
 	}
 	return nil
 }
@@ -230,7 +230,7 @@ func GetPointersToFields(rows *sql.Rows, pointerToStruct interface{}) ([]interfa
 	// Gets the names of columns in the query
 	columns, err := rows.Columns()
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, fmt.Errorf("in GetPointersToFields while getting columns faced the error: %w", err)
 	}
 	for i, name := range columns {
 		columns[i] = canonicalName(name)
@@ -267,13 +267,13 @@ func GetPointersToFields(rows *sql.Rows, pointerToStruct interface{}) ([]interfa
 	// Demand that all fields in struct gets filled
 	if n != len(names) {
 		diff := stringSliceDiff(names, columns)
-		return nil, errors.Errorf("Failed to map all struct fields to query columns (names: %v, columns: %v, diff: %v)", names, columns, diff)
+		return nil, fmt.Errorf("Failed to map all struct fields to query columns (names: %v, columns: %v, diff: %v)", names, columns, diff)
 	}
 
 	// Demand that all query columns gets scanned
 	if len(columns) > len(ptrs) {
 		diff := stringSliceDiff(names, columns)
-		return nil, errors.Errorf("Failed to map all query columns to struct fields (names: %v, columns: %v, diff: %v)", names, columns, diff)
+		return nil, fmt.Errorf("Failed to map all query columns to struct fields (names: %v, columns: %v, diff: %v)", names, columns, diff)
 	}
 	return ptrs, nil
 }
