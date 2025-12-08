@@ -42,7 +42,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.18.x'
+          go-version: '1.24.x'
           cache-dependency-path: go/changefeed/go.sum
 
       - name: Wait for SQL Server to be ready
