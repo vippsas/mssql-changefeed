@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
     <PropertyGroup>
         <TargetFramework>net8.0</TargetFramework>
@@ -20,7 +20,7 @@
     </ItemGroup>
 
     <ItemGroup>
-        <EmbeddedResource Include="../../../migrations/2001.changefeed-v2.sql" />
+        <EmbeddedResource Include="../../../migrations/2001.changefeed-v3.sql" />
     </ItemGroup>
 
 </Project>

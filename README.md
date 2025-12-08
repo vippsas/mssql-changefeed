@@ -31,7 +31,7 @@ of the race condition.
 The Go code in this library *is only for testing purposes*. The library
 itself is in pure Microsoft SQL.
 
-To install it, execute the file [migrations/2001.changefeed-v2.sql](migrations/2001.changefeed-v2.sql)
+To install it, execute the file [migrations/2001.changefeed-v3.sql](migrations/2001.changefeed-v3.sql)
 on your SQL server. This will create and populate the `changefeed` schema.
 
 Further usage depends on which of the two available modes you use, as described below. 
