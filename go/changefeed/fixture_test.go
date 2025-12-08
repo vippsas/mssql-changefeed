@@ -74,7 +74,7 @@ func TestMain(m *testing.M) {
 
 	dsn := os.Getenv("SQLSERVER_DSN")
 	if dsn == "" {
-		dsn = "sqlserver://localhost?database=master&user id=sa&password=RootPw1"
+		dsn = "sqlserver://localhost?database=master&user id=sa&password=VippsPw1"
 		//panic("Must set SQLSERVER_DSN to run tests")
 	}
 	dsn = dsn + "&log=3"

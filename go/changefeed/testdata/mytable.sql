@@ -61,3 +61,15 @@ create table myservice.TestSerializeWriters (
     Data varchar(max) not null,
 );
 
+-- Tables for testing teardown_feed
+create table myservice.TestTeardownOutbox (
+    AggregateID bigint not null,
+    Version int not null,
+    Data varchar(max) not null,
+    primary key (AggregateID, Version)
+);
+
+create table myservice.TestTeardownBlocking (
+    EventID binary(16) primary key,
+    Data varchar(max) not null,
+);
