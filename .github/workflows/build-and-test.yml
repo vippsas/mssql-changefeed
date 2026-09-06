@@ -6,8 +6,8 @@ on:
       - main
 
 jobs:
-  build:
-    name: "Build and test"
+  test-dotnet:
+    name: "Build and test .NET"
     runs-on: ubuntu-22.04
 
     steps:
@@ -22,7 +22,45 @@ jobs:
         run: dotnet nuget update source GitHub_Nuget --store-password-in-clear-text -u USERNAME -p ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
-        run: dotnet build --configuration Release ./dotnet/VippsMobilePay.Changefeed
+        working-directory: dotnet/VippsMobilePay.Changefeed
+        run: dotnet build --configuration Release
 
       - name: Test
-        run: dotnet test --configuration Release ./dotnet/VippsMobilePay.Changefeed
+        working-directory: dotnet/VippsMobilePay.Changefeed
+        run: dotnet test --configuration Release
+
+  test-go:
+    name: "Build and test Go"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SQL Server container
+        run: docker compose -p mssql-changefeed -f docker-compose.test.yml up -d
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: go/changefeed/go.sum
+
+      - name: Wait for SQL Server to be ready
+        run: |
+          echo "Waiting for SQL Server to accept connections..."
+          for i in {1..30}; do
+            if docker exec mssql-changefeed-test /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P VippsPw1 -C -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server is ready!"
+              exit 0
+            fi
+            echo "Waiting... ($i/30)"
+            sleep 2
+          done
+          echo "SQL Server failed to start within 60 seconds"
+          exit 1
+
+      - name: Run Go tests
+        working-directory: go/changefeed
+        env:
+          SQLSERVER_DSN: "sqlserver://localhost?database=master&user id=sa&password=VippsPw1"
+        run: go test -v ./...

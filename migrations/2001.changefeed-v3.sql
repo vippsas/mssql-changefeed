@@ -855,3 +855,106 @@ as begin
     set @sql = [changefeed].sql_permissions_writer(@object_id, @changefeed_schema, @outbox);
     exec sp_executesql @sql;
 end
+
+go
+
+create or alter procedure [changefeed].teardown_feed(
+    @table_name nvarchar(max)
+)
+as
+begin
+    set xact_abort on;
+    begin try
+        -- Validate that either the table exists OR at least one changefeed object exists
+        -- This prevents silent no-ops when called with a typo or non-existent table
+        declare @object_id int = object_id(@table_name, 'U');
+        if @object_id is null and object_id(concat('[changefeed].[state:', @table_name, ']')) is null
+            throw 71001, 'teardown_feed: no table or changefeed state table found for the specified @table_name', 1;
+
+        -- If the table has been deleted, use the provided @table_name directly to still enable such cleanups
+        declare @unquoted_qualified_table_name nvarchar(max);
+        if @object_id is not null
+            set @unquoted_qualified_table_name = [changefeed].sql_unquoted_qualified_table_name(@object_id);
+        else
+            set @unquoted_qualified_table_name = @table_name;
+            
+        declare @quoted_changefeed_schema nvarchar(max) = '[changefeed]';
+        declare @changefeed_schema nvarchar(max) = substring(@quoted_changefeed_schema, 2, len(@quoted_changefeed_schema) - 2);
+
+        declare @sql nvarchar(max);
+
+        -- identifying below the different objects with (blocking) or (outbox) when only used for one of them just to make it clear
+
+        -- permissions
+
+        -- (outbox) reader role
+        declare @reader_role nvarchar(max) = quotename(concat(@changefeed_schema, '.readers:', @unquoted_qualified_table_name));
+        set @sql = concat('drop role if exists ', @reader_role);
+        exec sp_executesql @sql;
+
+        -- (outbox) reader user
+        declare @user nvarchar(max) = quotename(concat(@changefeed_schema, '.user.readers:', @unquoted_qualified_table_name));
+        set @sql = concat('drop user if exists ', @user);
+        exec sp_executesql @sql;
+
+        -- (outbox) reader certificate
+        declare @certificate nvarchar(max) = quotename(concat(@changefeed_schema, '.cert.readers:', @unquoted_qualified_table_name));
+        set @sql = concat('if cert_id(''', @changefeed_schema, '.cert.readers:', @unquoted_qualified_table_name, ''') is not null drop certificate ', @certificate);
+        exec sp_executesql @sql;
+
+        -- writer role
+        declare @writer nvarchar(max) = quotename(concat(@changefeed_schema, '.writers:', @unquoted_qualified_table_name));
+        set @sql = concat('drop role if exists ', @writer);
+        exec sp_executesql @sql;
+
+        -- procedures and function
+
+        -- (outbox) read_feed (depends on feed_write_lock and update_state proc so deleting first even if sql doesn't check procedure dependency when dropping)
+        set @sql = concat('drop procedure if exists ', quotename(@changefeed_schema), '.', quotename(concat('read_feed:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (blocking) lock (depends on update_state proc so deleting first even if sql doesn't check procedure dependency when dropping)
+        set @sql = concat('drop procedure if exists ', quotename(@changefeed_schema), '.', quotename(concat('lock:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- feed_write_lock
+        set @sql = concat('drop procedure if exists ', quotename(@changefeed_schema), '.', quotename(concat('feed_write_lock:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- update_state
+        set @sql = concat('drop procedure if exists ', quotename(@changefeed_schema), '.', quotename(concat('update_state:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (blocking) ulid function
+        set @sql = concat('drop function if exists ', quotename(@changefeed_schema), '.', quotename(concat('ulid:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+
+        -- tables and associated sequence and type
+
+        -- state table
+        set @sql = concat('drop table if exists ', quotename(@changefeed_schema), '.', quotename(concat('state:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (outbox) feed table
+        set @sql = concat('drop table if exists ', quotename(@changefeed_schema), '.', quotename(concat('feed:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (outbox) read table
+        set @sql = concat('drop table if exists ', quotename(@changefeed_schema), '.', quotename(concat('outbox:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (outbox) read table sequence
+        set @sql = concat('drop sequence if exists ', quotename(@changefeed_schema), '.', quotename(concat('sequence:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+        -- (outbox) read type
+        set @sql = concat('drop type if exists ', quotename(@changefeed_schema), '.', quotename(concat('type:read:', @unquoted_qualified_table_name)));
+        exec sp_executesql @sql;
+
+    end try
+    begin catch
+        if @@trancount > 0 rollback;
+        throw;
+    end catch
+end

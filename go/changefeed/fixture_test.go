@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microsoft/go-mssqldb"
 	"github.com/gofrs/uuid"
+	mssql "github.com/microsoft/go-mssqldb"
+	msdsn "github.com/microsoft/go-mssqldb/msdsn"
 )
 
 type StdoutLogger struct {
@@ -37,7 +38,7 @@ var fixture = Fixture{}
 
 func (f *Fixture) RunMigrations() {
 	for _, filename := range []string{
-		"../../migrations/2001.changefeed-v2.sql",
+		"../../migrations/2001.changefeed-v3.sql",
 		"testdata/mytable.sql",
 	} {
 		migrationSql, err := ioutil.ReadFile(filename)
@@ -73,7 +74,7 @@ func TestMain(m *testing.M) {
 
 	dsn := os.Getenv("SQLSERVER_DSN")
 	if dsn == "" {
-		dsn = "sqlserver://localhost?database=master&user id=sa&password=RootPw1"
+		dsn = "sqlserver://localhost?database=master&user id=sa&password=VippsPw1"
 		//panic("Must set SQLSERVER_DSN to run tests")
 	}
 	dsn = dsn + "&log=3"
@@ -123,7 +124,7 @@ func TestMain(m *testing.M) {
 		_ = adminDb.Close()
 	}()
 
-	pdsn, _, err := msdsn.Parse(dsn)
+	pdsn, err := msdsn.Parse(dsn)
 	if err != nil {
 		panic(err)
 	}
